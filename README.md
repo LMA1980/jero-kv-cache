@@ -27,3 +27,7 @@ Context memory holder daemon and shared memory arena management for the SpacemiT
 For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
 - Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
 - Specs: [specs/memory/kv-holder.md](https://github.com/LMA1980/model-runner/blob/main/specs/memory/kv-holder.md)
+
+## License
+
+Licensed under the GNU Lesser General Public License v3.0 with the LGPL-3.0 Linking Exception (`LGPL-3.0-only WITH LGPL-3.0-linking-exception`). See [LICENSE](LICENSE) for details.
