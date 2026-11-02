@@ -1,0 +1,6 @@
+name = "k3-kv"
+# Crate-embedded Symposium manifest for k3-kv.
+
+[[plugins]]
+depends-on = ["k3-core"]
+source.cargo = "k3-core"

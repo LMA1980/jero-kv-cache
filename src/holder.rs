@@ -660,6 +660,10 @@ impl KvHolder {
 
 /// Initializes the `ArenaHeader`, `KvBlockMeta` entries, and slot/slab headers
 /// within a newly mapped shared memory arena.
+#[expect(
+    clippy::too_many_lines,
+    reason = "initializes all arena structures in single sequential pass"
+)]
 fn initialize_arena_contents(
     arena: &mut SharedMemoryArena,
     config: &ArenaAllocationConfig,
@@ -687,7 +691,11 @@ fn initialize_arena_contents(
         kv_blocks_offset: layout.kv_blocks_offset,
         output_slabs_offset: layout.output_slabs_offset,
         generation_counter: 1,
-        _reserved: [0; 40],
+        swa_window_size: 0,
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        derived_weights_offset: 0,
+        _reserved: [0; 24],
     };
     hdr.validate()
         .map_err(|msg| KvError::InvalidDimensions(msg.to_string()))?;
