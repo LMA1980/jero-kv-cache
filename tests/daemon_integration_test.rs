@@ -1,4 +1,4 @@
-//! End-to-end integration tests for `k3-kv` daemon lifecycle, CLI, Fory IPC, and `SCM_RIGHTS` FD transfer.
+//! End-to-end integration tests for `jero-kv-cache` daemon lifecycle, CLI, Fory IPC, and `SCM_RIGHTS` FD transfer.
 
 use std::fs;
 use std::os::unix::net::UnixStream;
@@ -8,19 +8,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use k3_core::ipc::layout::{ARENA_MAGIC, ARENA_VERSION, TAG_PERSIST};
-use k3_core::ipc::protocol::{
+use jero_core::ipc::layout::{ARENA_MAGIC, ARENA_VERSION, TAG_PERSIST};
+use jero_core::ipc::protocol::{
     AllocateArenaRequest, DeallocateArenaRequest, GetArenaFdRequest, IpcMessage, PingRequest,
     PingResponse, StatusCode, recv_msg_frame, send_msg_frame,
 };
-use k3_core::ipc::shm::SharedMemoryArena;
+use jero_core::ipc::shm::SharedMemoryArena;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Helper to generate a unique temporary socket path within OS limits (104 chars on macOS).
 fn generate_test_socket_path() -> PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("k3_kv_test_{}_{}.sock", std::process::id(), id))
+    std::env::temp_dir().join(format!("jero_kv_test_{}_{}.sock", std::process::id(), id))
 }
 
 /// Helper struct that spawns and supervises a test daemon process with automatic cleanup.
@@ -31,7 +31,7 @@ struct DaemonHarness {
 
 impl DaemonHarness {
     fn start(socket_path: PathBuf, max_memory_bytes: Option<u64>) -> Self {
-        let bin = env!("CARGO_BIN_EXE_k3-kv");
+        let bin = env!("CARGO_BIN_EXE_jero-kv-cache");
         let mut cmd = Command::new(bin);
         cmd.arg("--socket").arg(&socket_path).arg("--verbose");
 
@@ -39,7 +39,7 @@ impl DaemonHarness {
             cmd.arg("--max-memory-bytes").arg(max_bytes.to_string());
         }
 
-        let child = cmd.spawn().expect("failed to spawn k3-kv daemon");
+        let child = cmd.spawn().expect("failed to spawn jero-kv-cache daemon");
 
         // Wait until socket file appears and accepts connections (up to 3 seconds)
         let start = Instant::now();
@@ -58,7 +58,7 @@ impl DaemonHarness {
 
         assert!(
             connected,
-            "timed out waiting for k3-kv socket to become ready at {}",
+            "timed out waiting for jero-kv-cache socket to become ready at {}",
             socket_path.display()
         );
 
@@ -101,7 +101,7 @@ impl Drop for DaemonHarness {
 
 #[test]
 fn test_cli_invalid_arguments_return_exit_code_2() {
-    let bin = env!("CARGO_BIN_EXE_k3-kv");
+    let bin = env!("CARGO_BIN_EXE_jero-kv-cache");
 
     // Case 1: Unrecognized flag
     let out1 = Command::new(bin)
@@ -150,7 +150,7 @@ fn test_cli_invalid_arguments_return_exit_code_2() {
 
 #[test]
 fn test_cli_help_and_version_return_exit_code_0() {
-    let bin = env!("CARGO_BIN_EXE_k3-kv");
+    let bin = env!("CARGO_BIN_EXE_jero-kv-cache");
 
     let out_help = Command::new(bin).arg("--help").output().expect("run help");
     assert_eq!(out_help.status.code(), Some(0));
@@ -161,7 +161,7 @@ fn test_cli_help_and_version_return_exit_code_0() {
         .output()
         .expect("run version");
     assert_eq!(out_ver.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&out_ver.stdout).contains("k3-kv"));
+    assert!(String::from_utf8_lossy(&out_ver.stdout).contains("jero-kv-cache"));
 }
 
 #[test]

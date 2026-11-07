@@ -1,6 +1,6 @@
-name = "k3-kv"
-# Crate-embedded Symposium manifest for k3-kv.
+name = "jero-kv-cache"
+# Crate-embedded Symposium manifest for jero-kv-cache.
 
 [[plugins]]
-depends-on = ["k3-core"]
-source.cargo = "k3-core"
+depends-on = ["jero-core"]
+source.cargo = "jero-core"

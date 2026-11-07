@@ -13,13 +13,13 @@ use std::sync::{Arc, RwLock};
 
 use zerocopy::FromBytes;
 
-use k3_core::K3Error;
-use k3_core::ipc::layout::{
+use jero_core::K3Error;
+use jero_core::ipc::layout::{
     ARENA_MAGIC, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS, CACHELINE_ALIGNMENT, KvBlockMeta,
     OutputSlabHeader, SLAB_STATUS_IDLE, TAG_FREE, TokenInputSlotHeader,
 };
-use k3_core::ipc::protocol::{AllocateArenaRequest, StatusCode};
-use k3_core::ipc::shm::{
+use jero_core::ipc::protocol::{AllocateArenaRequest, StatusCode};
+use jero_core::ipc::shm::{
     ArenaOptions, DEFAULT_LIMIT_MEMLOCK_BYTES, IpcError, SharedMemoryArena, system_page_size,
 };
 
@@ -479,7 +479,7 @@ impl KvHolder {
         })?;
 
         let arena_id = self.next_arena_id.fetch_add(1, Ordering::Relaxed);
-        let shm_name = format!("k3_kv_{}_{}", config.model_id, arena_id);
+        let shm_name = format!("jero_kv_{}_{}", config.model_id, arena_id);
 
         // Pre-flight check and atomic reservation under write lock
         {
@@ -522,8 +522,8 @@ impl KvHolder {
                         guard.allocated_bytes.saturating_sub(layout.total_bytes);
                 }
                 return match err {
-                    IpcError::InsufficientLockableMemory(k3e) => {
-                        let req = match k3e {
+                    IpcError::InsufficientLockableMemory(err) => {
+                        let req = match err {
                             K3Error::InsufficientLockableMemory { required_bytes, .. } => {
                                 required_bytes
                             }

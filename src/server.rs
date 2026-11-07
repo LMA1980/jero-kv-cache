@@ -1,4 +1,4 @@
-//! Unix Domain Socket server and message dispatch loop for `k3-kv`.
+//! Unix Domain Socket server and message dispatch loop for `jero-kv-cache`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -11,17 +11,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use k3_core::ipc::protocol::{
+use jero_core::ipc::protocol::{
     AllocateArenaRequest, AllocateArenaResponse, DeallocateArenaRequest, DeallocateArenaResponse,
     GetArenaFdRequest, GetArenaFdResponse, IpcMessage, PingRequest, PingResponse, StatusCode,
     global_fory, recv_frame, send_msg_frame,
 };
-use k3_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
+use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 
 use crate::holder::KvHolder;
 
-/// Default Unix domain socket path for `k3-kv`.
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/k3-kv.sock";
+/// Default Unix domain socket path for `jero-kv-cache`.
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/jero-kv-cache.sock";
 
 /// Configuration for [`KvServer`].
 #[derive(Debug, Clone)]
@@ -87,7 +87,7 @@ pub fn prepare_and_bind_socket(socket_path: &Path) -> io::Result<tokio::net::Uni
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!(
-                        "Another k3-kv daemon is actively listening on {}",
+                        "Another jero-kv-cache daemon is actively listening on {}",
                         socket_path.display()
                     ),
                 ));
@@ -223,7 +223,7 @@ impl KvServer {
                             match stream.into_std() {
                                 Ok(std_stream) => {
                                     if let Err(e) = std_stream.set_nonblocking(false) {
-                                        eprintln!("[k3-kv] Failed to set stream blocking mode: {e}");
+                                        eprintln!("[jero-kv-cache] Failed to set stream blocking mode: {e}");
                                         continue;
                                     }
 
@@ -261,12 +261,12 @@ impl KvServer {
                                     });
                                 }
                                 Err(e) => {
-                                    eprintln!("[k3-kv] Failed to convert tokio stream to std: {e}");
+                                    eprintln!("[jero-kv-cache] Failed to convert tokio stream to std: {e}");
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("[k3-kv] Listener accept error: {e}");
+                            eprintln!("[jero-kv-cache] Listener accept error: {e}");
                         }
                     }
                 }
@@ -445,7 +445,7 @@ pub fn dispatch_single_request(
 
         // 5. Compute Worker Commands sent to KV holder -> CapabilityMismatch (Exit code 10)
         201..=206 => Err(DispatchError::CapabilityMismatch(format!(
-            "k3-kv is a context memory holder daemon and does not execute worker commands (type {type_id})"
+            "jero-kv-cache is a context memory holder daemon and does not execute worker commands (type {type_id})"
         ))),
 
         // 6. Unknown Type ID
@@ -458,13 +458,13 @@ pub fn dispatch_single_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::ipc::layout::{ARENA_MAGIC, TAG_PERSIST};
-    use k3_core::ipc::protocol::recv_msg_frame;
-    use k3_core::ipc::shm::SharedMemoryArena;
+    use jero_core::ipc::layout::{ARENA_MAGIC, TAG_PERSIST};
+    use jero_core::ipc::protocol::recv_msg_frame;
+    use jero_core::ipc::shm::SharedMemoryArena;
 
     #[test]
     fn test_handle_connection_full_lifecycle() {
-        let (server_fd, client_fd) = k3_core::ipc::protocol::create_uds_socket_pair().unwrap();
+        let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
         let client_stream = UnixStream::from(client_fd);
 
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_scm_rights_fd_zero_copy_mutation() {
-        let (server_fd, client_fd) = k3_core::ipc::protocol::create_uds_socket_pair().unwrap();
+        let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
         let client_stream = UnixStream::from(client_fd);
 
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_protocol_memlock_ceiling_rejection() {
-        let (server_fd, client_fd) = k3_core::ipc::protocol::create_uds_socket_pair().unwrap();
+        let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
         let client_stream = UnixStream::from(client_fd);
 
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_corrupt_and_unsupported_frames_handling() {
-        let (server_fd, client_fd) = k3_core::ipc::protocol::create_uds_socket_pair().unwrap();
+        let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
         let client_stream = UnixStream::from(client_fd);
 
@@ -655,7 +655,7 @@ mod tests {
 
         // 1. Send compute worker command (ForwardPassCommand, Type ID: 202)
         let worker_cmd =
-            IpcMessage::ForwardPassCommand(k3_core::ipc::protocol::ForwardPassCommand {
+            IpcMessage::ForwardPassCommand(jero_core::ipc::protocol::ForwardPassCommand {
                 request_id: 1,
                 sequence_id: 1,
                 token_offset: 0,
@@ -674,7 +674,7 @@ mod tests {
 
         // 2. Send corrupted Fory payload with known Type ID 101
         let garbage_payload = b"TOTALLY_CORRUPTED_FORY_DATA";
-        k3_core::ipc::protocol::send_frame(client_stream.as_raw_fd(), 101, garbage_payload, None)
+        jero_core::ipc::protocol::send_frame(client_stream.as_raw_fd(), 101, garbage_payload, None)
             .unwrap();
         let (resp2, _) = recv_msg_frame(&client_stream).unwrap();
         match resp2 {
@@ -690,9 +690,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stale_socket_cleanup_and_graceful_shutdown() {
-        let tmp_dir = std::env::temp_dir().join(format!("k3_kv_srv_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("jero_kv_srv_{}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
-        let sock_path = tmp_dir.join("k3-kv.sock");
+        let sock_path = tmp_dir.join("jero-kv-cache.sock");
 
         // Create a stale dummy file
         fs::write(&sock_path, b"stale data").unwrap();
@@ -747,9 +747,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_client_connections() {
-        let tmp_dir = std::env::temp_dir().join(format!("k3_kv_con_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("jero_kv_con_{}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
-        let sock_path = tmp_dir.join("k3-kv.sock");
+        let sock_path = tmp_dir.join("jero-kv-cache.sock");
 
         let config = ServerConfig {
             socket_path: sock_path.clone(),
@@ -824,9 +824,9 @@ mod tests {
     async fn test_server_shutdown_unblocks_connected_client_task() {
         use std::io::Read;
 
-        let tmp_dir = std::env::temp_dir().join(format!("k3_kv_unblock_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("jero_kv_unblock_{}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
-        let sock_path = tmp_dir.join("k3-kv.sock");
+        let sock_path = tmp_dir.join("jero-kv-cache.sock");
 
         let config = ServerConfig {
             socket_path: sock_path.clone(),
