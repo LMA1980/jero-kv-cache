@@ -24,9 +24,9 @@ Context memory holder daemon and shared memory arena management for the SpacemiT
 - **Fault Survival**: Survives worker abnormal termination and supervisor reconnects, retaining active KV context blocks.
 
 ## Architecture & Specifications
-For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
-- Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
-- Specs: [specs/memory/kv-holder.md](https://github.com/LMA1980/model-runner/blob/main/specs/memory/kv-holder.md)
+For master architecture and detailed component specifications, see the parent [jero-runner](https://github.com/LMA1980/jero-runner) repository:
+- Master Plan: [PLAN.md](https://github.com/LMA1980/jero-runner/blob/main/PLAN.md)
+- Specs: [specs/memory/kv-holder.md](https://github.com/LMA1980/jero-runner/blob/main/specs/memory/kv-holder.md)
 
 ## License
 
