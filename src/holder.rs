@@ -786,6 +786,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_arena_allocation_and_header_initialization() {
         let holder = KvHolder::new();
         let config = ArenaAllocationConfig::new("test_model", 64, 64, 2)
@@ -862,6 +863,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_memlock_ceiling_rejection_multi_arena_cumulative() {
         let config = ArenaAllocationConfig::new("model_a", 64, 64, 2);
         let layout = compute_arena_layout(&config).expect("layout");
@@ -911,6 +913,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_arena_lookup_and_fd_duplication() {
         use std::os::fd::AsRawFd;
 
@@ -936,6 +939,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_arena_deallocation_and_clear() {
         let holder = KvHolder::new();
         let config = ArenaAllocationConfig::new("model_clear", 64, 64, 2);

@@ -463,6 +463,85 @@ mod tests {
     use jero_core::ipc::shm::SharedMemoryArena;
 
     #[test]
+    fn test_dispatch_single_request_in_memory() {
+        let holder = Arc::new(KvHolder::with_memlock_ceiling(64 * 1024));
+        let fory = global_fory();
+
+        // 1. PingRequest (Type ID: 107)
+        let ping_bytes = fory
+            .serialize(&PingRequest {
+                timestamp_ns: 42_000,
+            })
+            .expect("serialize ping");
+        let (resp, fd) =
+            dispatch_single_request(107, &ping_bytes, &holder, fory).expect("dispatch ping");
+        assert!(fd.is_none());
+        assert_eq!(
+            resp,
+            IpcMessage::PingResponse(PingResponse {
+                timestamp_ns: 42_000
+            })
+        );
+
+        // 2. AllocateArenaRequest exceeding memlock ceiling (Type ID: 101)
+        let alloc_bytes = fory
+            .serialize(&AllocateArenaRequest {
+                model_id: "oversized".to_owned(),
+                arena_bytes: 1024 * 1024,
+                n_ctx: 64,
+                max_blocks: 4,
+            })
+            .expect("serialize alloc");
+        let (resp_alloc, fd_alloc) =
+            dispatch_single_request(101, &alloc_bytes, &holder, fory).expect("dispatch alloc");
+        assert!(fd_alloc.is_none());
+        match resp_alloc {
+            IpcMessage::AllocateArenaResponse(r) => {
+                assert_eq!(r.status, StatusCode::InsufficientLockableMemory);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 3. GetArenaFdRequest not found (Type ID: 103)
+        let get_fd_bytes = fory
+            .serialize(&GetArenaFdRequest { arena_id: 999 })
+            .expect("serialize get_fd");
+        let (resp_fd, fd_opt) =
+            dispatch_single_request(103, &get_fd_bytes, &holder, fory).expect("dispatch get_fd");
+        assert!(fd_opt.is_none());
+        match resp_fd {
+            IpcMessage::GetArenaFdResponse(r) => {
+                assert_eq!(r.status, StatusCode::ArenaNotFound);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 4. DeallocateArenaRequest not found (Type ID: 105)
+        let dealloc_bytes = fory
+            .serialize(&DeallocateArenaRequest { arena_id: 999 })
+            .expect("serialize dealloc");
+        let (resp_dealloc, _) =
+            dispatch_single_request(105, &dealloc_bytes, &holder, fory).expect("dispatch dealloc");
+        match resp_dealloc {
+            IpcMessage::DeallocateArenaResponse(r) => {
+                assert_eq!(r.status, StatusCode::ArenaNotFound);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 5. Worker command rejected (Type ID: 202) and corrupt payload rejected
+        assert!(matches!(
+            dispatch_single_request(202, &[], &holder, fory),
+            Err(DispatchError::CapabilityMismatch(_))
+        ));
+        assert!(matches!(
+            dispatch_single_request(101, b"CORRUPT", &holder, fory),
+            Err(DispatchError::ProtocolError(_))
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_handle_connection_full_lifecycle() {
         let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
@@ -537,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_scm_rights_fd_zero_copy_mutation() {
         let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
@@ -605,6 +685,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_protocol_memlock_ceiling_rejection() {
         let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
@@ -641,6 +722,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_corrupt_and_unsupported_frames_handling() {
         let (server_fd, client_fd) = jero_core::ipc::protocol::create_uds_socket_pair().unwrap();
         let server_stream = UnixStream::from(server_fd);
@@ -689,6 +771,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)]
     async fn test_stale_socket_cleanup_and_graceful_shutdown() {
         let tmp_dir = std::env::temp_dir().join(format!("jero_kv_srv_{}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
@@ -746,6 +829,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg_attr(miri, ignore)]
     async fn test_concurrent_client_connections() {
         let tmp_dir = std::env::temp_dir().join(format!("jero_kv_con_{}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
@@ -821,6 +905,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)]
     async fn test_server_shutdown_unblocks_connected_client_task() {
         use std::io::Read;
 
