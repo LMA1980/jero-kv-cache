@@ -1,4 +1,4 @@
-//! Adversarial stress test harness for `KvServer` and `k3-kv` daemon binary.
+//! Adversarial stress test harness for `KvServer` and `jero-kv-cache` daemon binary.
 //!
 //! Evaluates resilience against malformed/truncated Fory frames, corrupt magic numbers,
 //! oversized payloads (>16 MiB), unknown type IDs, concurrent client load, abrupt client SIGKILL,
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 
-use k3_core::ipc::protocol::{
+use jero_core::ipc::protocol::{
     AllocateArenaRequest, DeallocateArenaRequest, FRAME_HEADER_LEN, FRAME_MAGIC, GetArenaFdRequest,
     IpcMessage, MAX_PAYLOAD_LEN, PingRequest, PingResponse, StatusCode, recv_msg_frame, send_frame,
     send_msg_frame,
@@ -24,7 +24,7 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(100);
 
 fn unique_test_socket_path() -> PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("k3_kv_adv_{}_{}.sock", std::process::id(), id))
+    std::env::temp_dir().join(format!("jero_kv_adv_{}_{}.sock", std::process::id(), id))
 }
 
 struct TestDaemon {
@@ -34,14 +34,14 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(socket_path: PathBuf, max_mem: Option<u64>) -> Self {
-        let bin = env!("CARGO_BIN_EXE_k3-kv");
+        let bin = env!("CARGO_BIN_EXE_jero-kv-cache");
         let mut cmd = Command::new(bin);
         cmd.arg("--socket").arg(&socket_path);
         if let Some(m) = max_mem {
             cmd.arg("--max-memory-bytes").arg(m.to_string());
         }
 
-        let child = cmd.spawn().expect("spawn k3-kv daemon");
+        let child = cmd.spawn().expect("spawn jero-kv-cache daemon");
 
         let start = Instant::now();
         let timeout = Duration::from_secs(3);
@@ -57,7 +57,7 @@ impl TestDaemon {
             sleep(Duration::from_millis(15));
         }
 
-        assert!(connected, "timed out waiting for k3-kv socket");
+        assert!(connected, "timed out waiting for jero-kv-cache socket");
 
         Self {
             socket_path,
@@ -480,7 +480,7 @@ fn test_adversarial_client_sigkill_mid_transfer() {
     let mut daemon = TestDaemon::start(socket.clone(), None);
 
     // Spawn a child process that connects and gets killed mid-transfer
-    let bin = env!("CARGO_BIN_EXE_k3-kv");
+    let bin = env!("CARGO_BIN_EXE_jero-kv-cache");
 
     // Spawn dummy process
     let mut child = Command::new(bin)

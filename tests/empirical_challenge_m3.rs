@@ -1,4 +1,4 @@
-//! Empirical challenge and stress test harness for `k3-kv` (Milestone 3 of US-05).
+//! Empirical challenge and stress test harness for `jero-kv-cache` (Milestone 3 of US-05).
 //!
 //! Evaluates:
 //! 1. Operator `LimitMEMLOCK` ceiling boundary conditions:
@@ -24,13 +24,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use k3_core::ipc::layout::{
+use jero_core::ipc::layout::{
     ARENA_MAGIC, ARENA_VERSION, ArenaHeader, CACHELINE_ALIGNMENT, KvBlockMeta, OutputSlabHeader,
     TAG_FREE, TAG_PERSIST, TokenInputSlotHeader,
 };
-use k3_core::ipc::protocol::StatusCode;
-use k3_core::ipc::shm::system_page_size;
-use k3_kv::holder::{ArenaAllocationConfig, KvError, KvHolder, compute_arena_layout};
+use jero_core::ipc::protocol::StatusCode;
+use jero_core::ipc::shm::system_page_size;
+use jero_kv_cache::holder::{ArenaAllocationConfig, KvError, KvHolder, compute_arena_layout};
 
 /// Helper to count currently open file descriptors for leak verification.
 fn count_open_fds() -> usize {
@@ -257,7 +257,7 @@ fn test_challenge_rapid_allocate_deallocate_no_fd_or_memory_leaks() {
         let res = holder.allocate(&config).expect("sequential allocate");
         assert!(holder.total_allocated_bytes() > 0);
 
-        // Duplicate file descriptor (as k3-kv does for SCM_RIGHTS)
+        // Duplicate file descriptor (as jero-kv-cache does for SCM_RIGHTS)
         let fd = holder.get_arena_fd(res.arena_id).expect("fd dup");
         assert!(fd.as_raw_fd() >= 0);
         drop(fd); // Explicitly close duplicated descriptor
@@ -512,7 +512,7 @@ fn test_challenge_physical_memory_pointer_alignment_and_mutation_isolation() {
     // 3. In-place mutation and cross-region isolation test
     // Mutate block 0 and verify other regions are untouched
     let fd = holder.get_arena_fd(res.arena_id).expect("fd");
-    let mut mut_view = k3_core::ipc::shm::SharedMemoryArena::from_existing_fd(
+    let mut mut_view = jero_core::ipc::shm::SharedMemoryArena::from_existing_fd(
         fd,
         res.total_bytes as usize,
         "mut_view",
@@ -648,19 +648,20 @@ fn test_challenge_concurrent_multithreaded_stress_and_memlock_accounting() {
 
 #[test]
 fn test_challenge_daemon_sigterm_graceful_shutdown_with_connected_client() {
-    use k3_core::ipc::protocol::{
+    use jero_core::ipc::protocol::{
         IpcMessage, PingRequest, PingResponse, recv_msg_frame, send_msg_frame,
     };
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    let socket_path = std::env::temp_dir().join(format!("k3_kv_probe_{}.sock", std::process::id()));
+    let socket_path =
+        std::env::temp_dir().join(format!("jero_kv_probe_{}.sock", std::process::id()));
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    let bin = env!("CARGO_BIN_EXE_k3-kv");
+    let bin = env!("CARGO_BIN_EXE_jero-kv-cache");
     let mut child = Command::new(bin)
         .arg("--socket")
         .arg(&socket_path)
@@ -680,7 +681,7 @@ fn test_challenge_daemon_sigterm_graceful_shutdown_with_connected_client() {
         }
         thread::sleep(Duration::from_millis(15));
     }
-    assert!(connected, "timed out waiting for k3-kv daemon");
+    assert!(connected, "timed out waiting for jero-kv-cache daemon");
 
     // Connect client and send ping
     let stream = UnixStream::connect(&socket_path).expect("connect client");
@@ -733,7 +734,7 @@ fn test_challenge_daemon_sigterm_graceful_shutdown_with_connected_client() {
 
     assert!(
         exited,
-        "k3-kv daemon failed to exit within 2 seconds on SIGTERM while an active client connection is held open!"
+        "jero-kv-cache daemon failed to exit within 2 seconds on SIGTERM while an active client connection is held open!"
     );
     assert_eq!(
         exit_status.and_then(|s| s.code()),

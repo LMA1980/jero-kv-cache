@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-kv Release Pipeline"
+name: "jero-kv-cache Release Pipeline"
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,11 +30,11 @@ stages:
     tags: ["k3"]
     depends_on: ["coverage-check"]
     threads: 2
-    run: "cargo +nightly miri test -p k3-kv --lib || true"
+    run: "cargo +nightly miri test -p jero-kv-cache --lib || true"
 
   - id: build-release
     name: "Build Production Optimized Binary"
     tags: ["k3"]
     depends_on: ["miri-check"]
     threads: 4
-    run: "cargo build --release --package k3-kv"
+    run: "cargo build --release --package jero-kv-cache"

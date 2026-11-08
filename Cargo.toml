@@ -1,11 +1,11 @@
 [package]
-name = "k3-kv"
+name = "jero-kv-cache"
 description = "Context memory holder daemon and shared memory arena management for the SpacemiT K3 AI platform"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
-repository = "https://github.com/LMA1980/k3-kv"
+repository = "https://github.com/LMA1980/jero-kv-cache"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -19,15 +19,15 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [lib]
-name = "k3_kv"
+name = "jero_kv_cache"
 path = "src/lib.rs"
 
 [[bin]]
-name = "k3-kv"
+name = "jero-kv-cache"
 path = "src/main.rs"
 
 [dependencies]
-k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "feat/m4-dory-ngpt" }
+jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git" }
 arrow-array = "59.3.1"
 arrow-buffer = "59.3.1"
 fory = "1.7.7"

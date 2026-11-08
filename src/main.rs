@@ -1,4 +1,4 @@
-//! Standalone daemon binary for `k3-kv`: Context memory holder for the `SpacemiT` K3 platform.
+//! Standalone daemon binary for `jero-kv-cache`: Context memory holder for the `SpacemiT` K3 platform.
 //!
 //! Enforces operator memory lock bounds (ADR-037), holds isolated per-model shared-memory
 //! arenas (ADR-042, ADR-043), and passes arena file descriptors via `SCM_RIGHTS` over UDS.
@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use k3_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
-use k3_kv::holder::KvHolder;
-use k3_kv::server::{KvServer, SocketFileGuard};
+use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
+use jero_kv_cache::holder::KvHolder;
+use jero_kv_cache::server::{DEFAULT_SOCKET_PATH, KvServer, SocketFileGuard};
 
-/// Command line configuration for `k3-kv`.
+/// Command line configuration for `jero-kv-cache`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvConfig {
     /// Path to the Unix Domain Socket listener.
@@ -28,7 +28,7 @@ pub struct KvConfig {
 impl Default for KvConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from("/tmp/k3-kv.sock"),
+            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             max_memory_bytes: DEFAULT_LIMIT_MEMLOCK_BYTES, // 28 GiB
             verbose: false,
         }
@@ -56,7 +56,7 @@ impl KvConfig {
                     return Ok(None);
                 }
                 "--version" | "-V" => {
-                    println!("k3-kv {}", env!("CARGO_PKG_VERSION"));
+                    println!("jero-kv-cache {}", env!("CARGO_PKG_VERSION"));
                     return Ok(None);
                 }
                 "--socket" => {
@@ -136,13 +136,13 @@ fn parse_memory_bytes(s: &str) -> Result<u64, String> {
 
 fn print_usage() {
     println!(
-        r"k3-kv: Context memory holder daemon for the SpacemiT K3 platform.
+        r"jero-kv-cache: Context memory holder daemon for the SpacemiT K3 platform.
 
 USAGE:
-    k3-kv [OPTIONS]
+    jero-kv-cache [OPTIONS]
 
 OPTIONS:
-    --socket <path>              Path to Unix Domain Socket [default: /tmp/k3-kv.sock]
+    --socket <path>              Path to Unix Domain Socket [default: /tmp/jero-kv-cache.sock]
     --max-memory-bytes <bytes>   Maximum memory ceiling in bytes [default: 28 GiB]
     --verbose                    Enable verbose diagnostic output
     -h, --help                   Print help information
@@ -165,14 +165,14 @@ async fn main() -> ExitCode {
         Ok(None) => return ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[error] {err}");
-            eprintln!("Run 'k3-kv --help' for usage instructions.");
+            eprintln!("Run 'jero-kv-cache --help' for usage instructions.");
             return ExitCode::from(2);
         }
     };
 
     if config.verbose {
         eprintln!(
-            "[k3-kv] starting daemon (socket: {}, max_memory: {} bytes / {} GiB)",
+            "[jero-kv-cache] starting daemon (socket: {}, max_memory: {} bytes / {} GiB)",
             config.socket_path.display(),
             config.max_memory_bytes,
             config.max_memory_bytes / (1024 * 1024 * 1024)
@@ -202,14 +202,14 @@ async fn main() -> ExitCode {
     if config.socket_path.exists() {
         if UnixStream::connect(&config.socket_path).is_ok() {
             eprintln!(
-                "[error] another k3-kv daemon is already running on {}",
+                "[error] another jero-kv-cache daemon is already running on {}",
                 config.socket_path.display()
             );
             return ExitCode::from(1);
         }
         if config.verbose {
             eprintln!(
-                "[k3-kv] removing stale socket: {}",
+                "[jero-kv-cache] removing stale socket: {}",
                 config.socket_path.display()
             );
         }
@@ -248,14 +248,17 @@ async fn main() -> ExitCode {
     let server_task = tokio::spawn(async move { server_task_server.run().await });
 
     if config.verbose {
-        eprintln!("[k3-kv] listener ready on {}", config.socket_path.display());
+        eprintln!(
+            "[jero-kv-cache] listener ready on {}",
+            config.socket_path.display()
+        );
     }
 
     // Await server completion or OS termination signal
     tokio::select! {
         _ = sigint.recv() => {
             if config.verbose {
-                eprintln!("[k3-kv] received SIGINT (Ctrl+C), initiating graceful shutdown...");
+                eprintln!("[jero-kv-cache] received SIGINT (Ctrl+C), initiating graceful shutdown...");
             }
             server.shutdown();
             shutdown_handle.notify_waiters();
@@ -263,7 +266,7 @@ async fn main() -> ExitCode {
         }
         _ = sigterm.recv() => {
             if config.verbose {
-                eprintln!("[k3-kv] received SIGTERM, initiating graceful shutdown...");
+                eprintln!("[jero-kv-cache] received SIGTERM, initiating graceful shutdown...");
             }
             server.shutdown();
             shutdown_handle.notify_waiters();
@@ -285,7 +288,7 @@ async fn main() -> ExitCode {
     }
 
     if config.verbose {
-        eprintln!("[k3-kv] shutdown completed, unlinking socket");
+        eprintln!("[jero-kv-cache] shutdown completed, unlinking socket");
     }
 
     drop(socket_guard);

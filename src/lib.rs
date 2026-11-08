@@ -1,9 +1,9 @@
 //! Context memory holder daemon and shared memory arena management for the `SpacemiT` K3 AI platform.
 
-pub use k3_core::{DoryKvCacheMode, DoryLayerType, DoryMetadata};
-use k3_core::{K3Error, ModelMetadata};
+pub use jero_core::{DoryKvCacheMode, DoryLayerType, DoryMetadata};
+use jero_core::{K3Error, ModelMetadata};
 
-pub const KV_DAEMON_NAME: &str = "k3-kv";
+pub const KV_DAEMON_NAME: &str = "jero-kv-cache";
 
 /// Canonical 72-layer disaggregated sub-layer pattern for `Dory1.0-4B`.
 pub const CANONICAL_DORY_4B_PATTERN: &str =
@@ -322,11 +322,11 @@ impl DoryVirtualKvMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::{GgufFile, GgufValue};
+    use jero_core::{GgufFile, GgufValue};
 
     #[test]
     fn test_daemon_identity() {
-        assert_eq!(KV_DAEMON_NAME, "k3-kv");
+        assert_eq!(KV_DAEMON_NAME, "jero-kv-cache");
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
             ),
         ];
         let bytes =
-            k3_core::test_helpers::create_synthetic_gguf_v3_with_kvs("dory", 32, &extra_kvs, &[]);
+            jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs("dory", 32, &extra_kvs, &[]);
         let gguf = GgufFile::parse(&bytes).expect("parse synthetic dory gguf");
         let meta = gguf.metadata();
 
