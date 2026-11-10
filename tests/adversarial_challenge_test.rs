@@ -367,8 +367,8 @@ fn test_adversarial_unknown_and_worker_type_ids_return_capability_mismatch() {
 
     // 2. Unknown Type IDs
     let unknown_type_ids = [0_u16, 99, 100, 150, 300, 999, 65535];
-    for uid in unknown_type_ids {
-        send_frame(stream.as_raw_fd(), uid, b"unknown_type_payload", None).unwrap();
+    for type_id in unknown_type_ids {
+        send_frame(stream.as_raw_fd(), type_id, b"unknown_type_payload", None).unwrap();
         let (resp, opt_fd) = recv_msg_frame(&stream).unwrap();
         assert!(opt_fd.is_none());
         match resp {
@@ -376,7 +376,7 @@ fn test_adversarial_unknown_and_worker_type_ids_return_capability_mismatch() {
                 assert_eq!(
                     r.status,
                     StatusCode::CapabilityMismatch,
-                    "Expected CapabilityMismatch for unknown type ID {uid}"
+                    "Expected CapabilityMismatch for unknown type ID {type_id}"
                 );
             }
             other => panic!("expected CapabilityMismatch response, got {other:?}"),
