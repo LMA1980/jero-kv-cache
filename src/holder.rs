@@ -23,6 +23,41 @@ use jero_core::ipc::shm::{
     ArenaOptions, DEFAULT_LIMIT_MEMLOCK_BYTES, IpcError, SharedMemoryArena, system_page_size,
 };
 
+/// Per-layer KV cache retention policy for hybrid local/global attention models (ADR-027, ADR-037).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKvPolicy {
+    /// Full-context global attention retaining up to `n_ctx` tokens.
+    GlobalFullContext,
+    /// Sliding-window local attention retaining at most `window_tokens` tokens.
+    SlidingWindow {
+        /// Maximum sliding window token span.
+        window_tokens: u32,
+    },
+}
+
+/// Computes total 16-token KV layer-blocks across all layers for a hybrid local/global schedule.
+#[must_use]
+pub fn compute_hybrid_kv_block_count(n_ctx: u32, layer_policies: &[LayerKvPolicy]) -> u32 {
+    if n_ctx == 0 || layer_policies.is_empty() {
+        return 0;
+    }
+
+    let mut total_blocks = 0_u32;
+    for &policy in layer_policies {
+        let layer_tokens = match policy {
+            LayerKvPolicy::GlobalFullContext => n_ctx,
+            LayerKvPolicy::SlidingWindow { window_tokens } => n_ctx.min(window_tokens),
+        };
+        let layer_blocks = if layer_tokens == 0 {
+            0
+        } else {
+            layer_tokens.div_ceil(BLOCK_SIZE_TOKENS)
+        };
+        total_blocks = total_blocks.saturating_add(layer_blocks);
+    }
+    total_blocks
+}
+
 /// Sizing and geometry parameters for allocating a shared memory arena.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArenaAllocationConfig {
@@ -46,6 +81,8 @@ pub struct ArenaAllocationConfig {
     pub explicit_bytes: Option<u64>,
     /// Explicit block count override (e.g. `max_blocks` from `AllocateArenaRequest`).
     pub max_blocks: Option<u32>,
+    /// Optional per-layer hybrid local/global KV retention schedule.
+    pub layer_policies: Option<Vec<LayerKvPolicy>>,
 }
 
 impl ArenaAllocationConfig {
@@ -63,6 +100,7 @@ impl ArenaAllocationConfig {
             lock_memory: false,
             explicit_bytes: None,
             max_blocks: None,
+            layer_policies: None,
         }
     }
 
@@ -95,6 +133,7 @@ impl ArenaAllocationConfig {
             } else {
                 None
             },
+            layer_policies: None,
         }
     }
 
@@ -137,6 +176,13 @@ impl ArenaAllocationConfig {
     #[must_use]
     pub const fn with_max_blocks(mut self, max_blocks: u32) -> Self {
         self.max_blocks = Some(max_blocks);
+        self
+    }
+
+    /// Sets per-layer hybrid local/global KV retention policies.
+    #[must_use]
+    pub fn with_layer_policies(mut self, policies: Vec<LayerKvPolicy>) -> Self {
+        self.layer_policies = Some(policies);
         self
     }
 }
@@ -236,22 +282,56 @@ pub fn compute_arena_layout(
 
     // KvBlockData: cacheline aligned (64 bytes)
     let kv_blocks_offset = align_up_u64(token_slots_end, CACHELINE_ALIGNMENT as u64);
-    // 2 vectors (Key & Value) per token * num_layers * head_count_kv * head_dim * sizeof(f32)
-    let bytes_per_token = 2u64
-        .checked_mul(u64::from(config.num_layers))
-        .and_then(|v| v.checked_mul(u64::from(head_count_kv)))
-        .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
-        .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
-        .ok_or_else(|| KvError::InvalidDimensions("bytes_per_token overflowed u64".to_owned()))?;
-    let block_bytes = u64::from(BLOCK_SIZE_TOKENS)
-        .checked_mul(bytes_per_token)
-        .ok_or_else(|| KvError::InvalidDimensions("block_bytes overflowed u64".to_owned()))?;
-    let total_kv_blocks_bytes =
+    let total_kv_blocks_bytes = if let Some(policies) = config.layer_policies.as_deref() {
+        let expected_layers = usize::try_from(config.num_layers).unwrap_or(0);
+        if policies.len() != expected_layers {
+            return Err(KvError::InvalidDimensions(format!(
+                "layer_policies length ({}) does not match num_layers ({expected_layers})",
+                policies.len()
+            )));
+        }
+        let per_layer_bytes_per_token = 2u64
+            .checked_mul(u64::from(head_count_kv))
+            .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
+            .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("per_layer_bytes_per_token overflowed u64".to_owned())
+            })?;
+        let layer_block_bytes = u64::from(BLOCK_SIZE_TOKENS)
+            .checked_mul(per_layer_bytes_per_token)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("layer_block_bytes overflowed u64".to_owned())
+            })?;
+        let hybrid_blocks_per_slot = compute_hybrid_kv_block_count(config.n_ctx, policies);
+        let total_layer_blocks = u64::from(hybrid_blocks_per_slot)
+            .checked_mul(u64::from(active_slots))
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("hybrid total_layer_blocks overflowed u64".to_owned())
+            })?;
+        total_layer_blocks
+            .checked_mul(layer_block_bytes)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("hybrid total_kv_blocks_bytes overflowed u64".to_owned())
+            })?
+    } else {
+        // 2 vectors (Key & Value) per token * num_layers * head_count_kv * head_dim * sizeof(f32)
+        let bytes_per_token = 2u64
+            .checked_mul(u64::from(config.num_layers))
+            .and_then(|v| v.checked_mul(u64::from(head_count_kv)))
+            .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
+            .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("bytes_per_token overflowed u64".to_owned())
+            })?;
+        let block_bytes = u64::from(BLOCK_SIZE_TOKENS)
+            .checked_mul(bytes_per_token)
+            .ok_or_else(|| KvError::InvalidDimensions("block_bytes overflowed u64".to_owned()))?;
         u64::from(block_count)
             .checked_mul(block_bytes)
             .ok_or_else(|| {
                 KvError::InvalidDimensions("total_kv_blocks_bytes overflowed u64".to_owned())
-            })?;
+            })?
+    };
     let kv_blocks_end = kv_blocks_offset
         .checked_add(total_kv_blocks_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("kv_blocks_end overflowed u64".to_owned()))?;
@@ -984,6 +1064,61 @@ mod tests {
         assert_eq!(
             holder.allocate(&cfg).unwrap_err().status_code(),
             StatusCode::CapabilityMismatch
+        );
+    }
+
+    #[test]
+    fn test_compute_hybrid_kv_block_count() {
+        assert_eq!(compute_hybrid_kv_block_count(0, &[]), 0);
+
+        // Gemma 3 / 4: 36 layers in 5:1 local(1024) : global(n_ctx) pattern -> 30 local + 6 global.
+        let gemma3_policies: Vec<LayerKvPolicy> = (0..36)
+            .map(|l| {
+                if (l + 1) % 6 == 0 {
+                    LayerKvPolicy::GlobalFullContext
+                } else {
+                    LayerKvPolicy::SlidingWindow {
+                        window_tokens: 1024,
+                    }
+                }
+            })
+            .collect();
+        // 30 * (1024 / 16) + 6 * (32768 / 16) = 30 * 64 + 6 * 2048 = 1920 + 12288 = 14208.
+        assert_eq!(
+            compute_hybrid_kv_block_count(32_768, &gemma3_policies),
+            14_208
+        );
+
+        // Gemma 2: 26 layers in 1:1 alternating local(4096) : global(8192).
+        let gemma2_policies: Vec<LayerKvPolicy> = (0..26)
+            .map(|l| {
+                if l % 2 == 0 {
+                    LayerKvPolicy::SlidingWindow {
+                        window_tokens: 4096,
+                    }
+                } else {
+                    LayerKvPolicy::GlobalFullContext
+                }
+            })
+            .collect();
+        // 13 * 256 + 13 * 512 = 9984.
+        assert_eq!(
+            compute_hybrid_kv_block_count(8_192, &gemma2_policies),
+            9_984
+        );
+
+        // Arena layout with hybrid policies allocates strictly fewer bytes than homogeneous layout.
+        let full_cfg = ArenaAllocationConfig::new("gemma3", 32_768, 256, 36).with_head_count_kv(4);
+        let hybrid_cfg = ArenaAllocationConfig::new("gemma3", 32_768, 256, 36)
+            .with_head_count_kv(4)
+            .with_layer_policies(gemma3_policies);
+        let full_layout = compute_arena_layout(&full_cfg).expect("full layout");
+        let hybrid_layout = compute_arena_layout(&hybrid_cfg).expect("hybrid layout");
+        assert!(
+            hybrid_layout.total_bytes * 4 < full_layout.total_bytes,
+            "hybrid 5:1 arena ({}) should be >4x smaller than homogeneous full-context ({})",
+            hybrid_layout.total_bytes,
+            full_layout.total_bytes
         );
     }
 }

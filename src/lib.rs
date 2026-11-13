@@ -14,7 +14,7 @@ pub mod server;
 
 pub use holder::{
     ArenaAllocationConfig, ArenaAllocationResult, ComputedArenaLayout, KvError, KvHolder,
-    compute_arena_layout,
+    LayerKvPolicy, compute_arena_layout, compute_hybrid_kv_block_count,
 };
 pub use server::{
     DEFAULT_SOCKET_PATH, KvServer, ServerConfig, SocketFileGuard, handle_connection,
