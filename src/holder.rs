@@ -4,11 +4,11 @@
 //! and strict operator `LimitMEMLOCK` ceiling enforcement (28 GiB reference
 //! board ceiling, ADR-037 / AGENTS.md Rule 5).
 
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 use std::collections::HashMap;
 use std::fmt;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Arc, RwLock};
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -25,6 +25,12 @@ use jero_core::ipc::shm::{
     ArenaOptions, DEFAULT_LIMIT_MEMLOCK_BYTES, IpcError, SharedMemoryArena, system_page_size,
 };
 use jero_core::{KvCacheView, KvGeometry};
+
+/// Maximum number of tokens tracked by each [`KvBlockMeta`] cacheline entry.
+pub const KV_BLOCK_TOKEN_CAPACITY: usize = BLOCK_SIZE_TOKENS as usize;
+
+/// Canonical error alias for [`ArenaKvWriter`], [`ArenaKvReader`], and KV holder operations.
+pub type KvHolderError = KvError;
 
 /// Per-layer KV cache retention policy for hybrid local/global attention models (ADR-027, ADR-037).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1469,6 +1475,56 @@ impl<'a> ArenaHandle<'a> {
         kv_cache_view_from_arena_slice_mut(self.arena.as_mut_slice())
     }
 
+    /// Returns a zero-copy [`ArenaKvWriter`] over the arena's KV slab and `KvBlockMeta` table.
+    ///
+    /// # Errors
+    /// Returns [`KvError::IpcError`] if the arena mapping is read-only or unaligned for atomics,
+    /// or [`KvError::InvalidDimensions`] if header, KV slab, or block-meta geometry checks fail.
+    pub fn kv_writer(&mut self) -> Result<ArenaKvWriter<'_>, KvError> {
+        ArenaKvWriter::from_arena(self.arena)
+    }
+
+    /// Returns a zero-copy read-only [`ArenaKvReader`] over the arena's KV slab and `KvBlockMeta` table.
+    ///
+    /// # Errors
+    /// Returns [`KvError::IpcError`] if the metadata table is unaligned for atomics, or
+    /// [`KvError::InvalidDimensions`] if header, KV slab, or block-meta geometry checks fail.
+    pub fn kv_reader(&self) -> Result<ArenaKvReader<'_>, KvError> {
+        ArenaKvReader::from_arena(self.arena)
+    }
+
+    /// Advances [`KvBlockMeta::committed_token_count`] monotonically across all 16-token blocks
+    /// spanned by `[start_pos .. start_pos + seq_len)` using atomic `Release` stores.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the span is non-contiguous with the current committed watermark,
+    /// exceeds `seq_capacity`, overflows `usize`, or the arena is read-only or malformed.
+    pub fn commit_token_span(&mut self, start_pos: usize, seq_len: usize) -> Result<(), KvError> {
+        self.kv_writer()?.commit_token_span(start_pos, seq_len)
+    }
+
+    /// Alias for [`Self::commit_token_span`] committing a batched prefill token span across
+    /// spanned 16-token blocks with `Release` ordering.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if [`Self::commit_token_span`] fails.
+    pub fn commit_prefill_range(
+        &mut self,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<(), KvError> {
+        self.commit_token_span(start_pos, seq_len)
+    }
+
+    /// Returns the total number of contiguously committed tokens across this arena's `KvBlockMeta`
+    /// table, observed with `Acquire` ordering.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if header validation fails or block metadata is non-contiguous.
+    pub fn committed_tokens(&self) -> Result<usize, KvError> {
+        self.kv_reader()?.committed_tokens()
+    }
+
     /// Consumes the handle and returns the underlying [`SharedMemoryArena`].
     #[must_use]
     pub fn into_inner(self) -> &'a mut SharedMemoryArena {
@@ -1476,17 +1532,17 @@ impl<'a> ArenaHandle<'a> {
     }
 }
 
-/// Constructs a bounds-checked [`KvCacheView`] over an initialized arena byte buffer.
-///
-/// Exposed alongside [`ArenaHandle`] so layer-major `[layer][K|V][pos][kv_dim]` invariants can
-/// also be verified directly under Miri without OS `memfd_create` / `mmap` syscalls.
-///
-/// # Errors
-/// Returns [`KvError::InvalidDimensions`] if header validation fails, geometry or dtype checks
-/// fail, or the exact KV slab range violates header region bounds or `f32` alignment.
-pub fn kv_cache_view_from_arena_slice_mut(
-    arena_bytes: &mut [u8],
-) -> Result<KvCacheView<'_>, KvError> {
+const COMMITTED_TOKEN_COUNT_OFFSET: usize = offset_of!(KvBlockMeta, committed_token_count);
+const _: () = assert!(KV_BLOCK_TOKEN_CAPACITY == 16);
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedArenaKvSlab {
+    geometry: KvGeometry,
+    kv_offset: usize,
+    kv_end: usize,
+}
+
+fn validate_arena_kv_slab(arena_bytes: &[u8]) -> Result<ValidatedArenaKvSlab, KvError> {
     let (header, _) = ArenaHeader::ref_from_prefix(arena_bytes).map_err(|_| {
         KvError::InvalidDimensions("arena buffer smaller than ArenaHeader".to_owned())
     })?;
@@ -1576,11 +1632,727 @@ pub fn kv_cache_view_from_arena_slice_mut(
         )));
     }
 
-    let kv_bytes = &mut arena_bytes[kv_offset..kv_end];
+    Ok(ValidatedArenaKvSlab {
+        geometry,
+        kv_offset,
+        kv_end,
+    })
+}
+
+fn validate_arena_meta_bounds(
+    arena_bytes: &[u8],
+    seq_capacity: usize,
+    kv_offset: usize,
+) -> Result<(usize, usize, usize), KvError> {
+    if seq_capacity % KV_BLOCK_TOKEN_CAPACITY != 0 {
+        return Err(KvError::InvalidDimensions(format!(
+            "seq_capacity ({seq_capacity}) must be a multiple of KV_BLOCK_TOKEN_CAPACITY ({KV_BLOCK_TOKEN_CAPACITY})"
+        )));
+    }
+    let logical_block_count = seq_capacity / KV_BLOCK_TOKEN_CAPACITY;
+    let (header, _) = ArenaHeader::ref_from_prefix(arena_bytes).map_err(|_| {
+        KvError::InvalidDimensions("arena buffer smaller than ArenaHeader".to_owned())
+    })?;
+    let header_block_count = usize::try_from(header.block_count)
+        .map_err(|_| KvError::InvalidDimensions("block_count overflowed usize".to_owned()))?;
+    if header_block_count < logical_block_count {
+        return Err(KvError::InvalidDimensions(format!(
+            "header.block_count ({header_block_count}) smaller than required logical blocks ({logical_block_count})"
+        )));
+    }
+
+    let meta_offset = usize::try_from(header.meta_table_offset)
+        .map_err(|_| KvError::InvalidDimensions("meta_table_offset overflowed usize".to_owned()))?;
+    let meta_size = header_block_count
+        .checked_mul(size_of::<KvBlockMeta>())
+        .ok_or_else(|| {
+            KvError::InvalidDimensions("meta_table byte size overflowed usize".to_owned())
+        })?;
+    let meta_end = meta_offset
+        .checked_add(meta_size)
+        .ok_or_else(|| KvError::InvalidDimensions("meta_table end overflowed usize".to_owned()))?;
+    if meta_offset < size_of::<ArenaHeader>()
+        || meta_end > kv_offset
+        || meta_end > arena_bytes.len()
+    {
+        return Err(KvError::InvalidDimensions(format!(
+            "meta_table bounds [{meta_offset}..{meta_end}) overlap or exceed arena bounds (kv_offset={kv_offset}, arena_len={})",
+            arena_bytes.len()
+        )));
+    }
+    Ok((meta_offset, meta_end, logical_block_count))
+}
+
+fn validate_meta_slice_for_atomic(
+    meta_bytes: &[u8],
+    logical_block_count: usize,
+) -> Result<(), KvError> {
+    let required = logical_block_count
+        .checked_mul(size_of::<KvBlockMeta>())
+        .ok_or_else(|| {
+            KvError::InvalidDimensions(
+                "logical_block_count byte length overflowed usize".to_owned(),
+            )
+        })?;
+    if meta_bytes.len() < required {
+        return Err(KvError::InvalidDimensions(format!(
+            "meta_table byte len ({}) smaller than required ({required})",
+            meta_bytes.len()
+        )));
+    }
+    let field_addr = (meta_bytes.as_ptr() as usize) + COMMITTED_TOKEN_COUNT_OFFSET;
+    if field_addr % align_of::<AtomicU32>() != 0
+        || size_of::<KvBlockMeta>() % align_of::<AtomicU32>() != 0
+    {
+        return Err(KvError::IpcError(
+            "KvBlockMeta committed_token_count field is not 4-byte aligned for AtomicU32 access"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn block_committed_field_offset(
+    block_idx: usize,
+    logical_block_count: usize,
+    meta_len: usize,
+) -> Result<usize, KvError> {
+    if block_idx >= logical_block_count {
+        return Err(KvError::InvalidDimensions(format!(
+            "block index {block_idx} out of bounds for logical_block_count={logical_block_count}"
+        )));
+    }
+    let entry_start = block_idx * size_of::<KvBlockMeta>();
+    let entry_end = entry_start + size_of::<KvBlockMeta>();
+    if entry_end > meta_len {
+        return Err(KvError::InvalidDimensions(format!(
+            "block metadata entry[{block_idx}] end ({entry_end}) exceeds table len ({meta_len})"
+        )));
+    }
+    Ok(entry_start + COMMITTED_TOKEN_COUNT_OFFSET)
+}
+
+fn read_block_committed_tokens_from_slice(
+    meta_bytes: &[u8],
+    block_idx: usize,
+    logical_block_count: usize,
+) -> Result<u32, KvError> {
+    let field_off = block_committed_field_offset(block_idx, logical_block_count, meta_bytes.len())?;
+    let field_slice = &meta_bytes[field_off..field_off + size_of::<u32>()];
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "4-byte AtomicU32 alignment is verified by validate_meta_slice_for_atomic"
+    )]
+    // SAFETY: `field_slice` is 4 bytes within `meta_bytes` and 4-byte aligned as verified by
+    // `validate_meta_slice_for_atomic`; a single aligned `u32` `read_volatile` avoids multi-byte
+    // torn loads while preserving `&[u8]` shared-read provenance, and the trailing `Acquire` fence
+    // orders subsequent KV slab reads after the observed watermark.
+    let val = unsafe { field_slice.as_ptr().cast::<u32>().read_volatile() };
+    fence(Ordering::Acquire);
+    Ok(val)
+}
+
+fn store_block_committed_tokens_in_slice(
+    meta_bytes: &mut [u8],
+    block_idx: usize,
+    logical_block_count: usize,
+    new_count: u32,
+) -> Result<(), KvError> {
+    let field_off = block_committed_field_offset(block_idx, logical_block_count, meta_bytes.len())?;
+    let field_slice = &mut meta_bytes[field_off..field_off + size_of::<u32>()];
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "4-byte AtomicU32 alignment is verified by validate_meta_slice_for_atomic"
+    )]
+    // SAFETY: `field_slice` is exclusively borrowed (`&mut [u8]`), 4 bytes long, and 4-byte
+    // (`AtomicU32`) aligned as verified by `validate_meta_slice_for_atomic`.
+    unsafe {
+        AtomicU32::from_ptr(field_slice.as_mut_ptr().cast::<u32>())
+            .store(new_count, Ordering::Release);
+    }
+    Ok(())
+}
+
+fn committed_watermark_from_meta(
+    meta_bytes: &[u8],
+    logical_block_count: usize,
+) -> Result<usize, KvError> {
+    let mut watermark = 0_usize;
+    let mut seen_incomplete = false;
+    for block_idx in 0..logical_block_count {
+        let count_u32 =
+            read_block_committed_tokens_from_slice(meta_bytes, block_idx, logical_block_count)?;
+        let count = usize::try_from(count_u32).map_err(|_| {
+            KvError::InvalidDimensions("committed_token_count overflowed usize".to_owned())
+        })?;
+        if count > KV_BLOCK_TOKEN_CAPACITY {
+            return Err(KvError::InvalidDimensions(format!(
+                "block[{block_idx}] committed_token_count ({count}) exceeds capacity ({KV_BLOCK_TOKEN_CAPACITY})"
+            )));
+        }
+        if seen_incomplete && count > 0 {
+            return Err(KvError::InvalidDimensions(format!(
+                "non-contiguous committed_token_count in block[{block_idx}] ({count}) after incomplete prior block"
+            )));
+        }
+        watermark = watermark.checked_add(count).ok_or_else(|| {
+            KvError::InvalidDimensions("committed token watermark overflowed usize".to_owned())
+        })?;
+        if count < KV_BLOCK_TOKEN_CAPACITY {
+            seen_incomplete = true;
+        }
+    }
+    Ok(watermark)
+}
+
+fn commit_token_span_in_meta(
+    meta_bytes: &mut [u8],
+    logical_block_count: usize,
+    seq_capacity: usize,
+    start_pos: usize,
+    seq_len: usize,
+) -> Result<(), KvError> {
+    let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
+        KvError::InvalidDimensions("commit_token_span end_pos overflowed usize".to_owned())
+    })?;
+    if end_pos > seq_capacity {
+        return Err(KvError::InvalidDimensions(format!(
+            "commit span [{start_pos}..{end_pos}) exceeds seq_capacity ({seq_capacity})"
+        )));
+    }
+    let watermark = committed_watermark_from_meta(meta_bytes, logical_block_count)?;
+    if start_pos != watermark {
+        return Err(KvError::InvalidDimensions(format!(
+            "non-contiguous commit span: start_pos ({start_pos}) != current committed watermark ({watermark})"
+        )));
+    }
+    if seq_len == 0 {
+        return Ok(());
+    }
+
+    let first_block = start_pos / KV_BLOCK_TOKEN_CAPACITY;
+    let last_block = (end_pos - 1) / KV_BLOCK_TOKEN_CAPACITY;
+    if last_block >= logical_block_count {
+        return Err(KvError::InvalidDimensions(format!(
+            "last spanned block ({last_block}) exceeds logical_block_count ({logical_block_count})"
+        )));
+    }
+
+    // Ensure prior KV plane writes happen-before consumers observe advanced committed counts.
+    fence(Ordering::Release);
+    for block_idx in first_block..=last_block {
+        let block_start = block_idx * KV_BLOCK_TOKEN_CAPACITY;
+        let new_count_usize = (end_pos - block_start).min(KV_BLOCK_TOKEN_CAPACITY);
+        let new_count = u32::try_from(new_count_usize).map_err(|_| {
+            KvError::InvalidDimensions("block committed_token_count overflowed u32".to_owned())
+        })?;
+        store_block_committed_tokens_in_slice(
+            meta_bytes,
+            block_idx,
+            logical_block_count,
+            new_count,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Zero-copy batched KV slab writer and atomic [`KvBlockMeta`] committer over an initialized arena.
+#[derive(Debug)]
+pub struct ArenaKvWriter<'a> {
+    kv_view: KvCacheView<'a>,
+    meta_bytes: &'a mut [u8],
+    logical_block_count: usize,
+}
+
+impl<'a> ArenaKvWriter<'a> {
+    /// Wraps an initialized shared memory arena byte slice in a bounds-checked [`ArenaKvWriter`].
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if header, KV slab, or `KvBlockMeta` bounds fail, or
+    /// [`KvError::IpcError`] if alignment is invalid for `AtomicU32` metadata commits.
+    pub fn from_arena_slice(arena_bytes: &'a mut [u8]) -> Result<Self, KvError> {
+        let slab = validate_arena_kv_slab(arena_bytes)?;
+        let (meta_offset, meta_end, logical_block_count) =
+            validate_arena_meta_bounds(arena_bytes, slab.geometry.seq_capacity, slab.kv_offset)?;
+        let (head, tail) = arena_bytes.split_at_mut(slab.kv_offset);
+        let meta_bytes = &mut head[meta_offset..meta_end];
+        validate_meta_slice_for_atomic(meta_bytes, logical_block_count)?;
+
+        let kv_bytes = &mut tail[..(slab.kv_end - slab.kv_offset)];
+        let kv_f32s = <[f32]>::mut_from_bytes(kv_bytes).map_err(|err| {
+            KvError::InvalidDimensions(format!("KV slab byte slice conversion failed: {err:?}"))
+        })?;
+        let kv_view = KvCacheView::new(kv_f32s, slab.geometry)
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+
+        Ok(Self {
+            kv_view,
+            meta_bytes,
+            logical_block_count,
+        })
+    }
+
+    /// Wraps a writable [`SharedMemoryArena`] in a bounds-checked [`ArenaKvWriter`].
+    ///
+    /// # Errors
+    /// Returns [`KvError::IpcError`] if `arena` is read-only or unaligned, or
+    /// [`KvError::InvalidDimensions`] if header or layout checks fail.
+    pub fn from_arena(arena: &'a mut SharedMemoryArena) -> Result<Self, KvError> {
+        if arena.is_read_only() {
+            return Err(KvError::IpcError(
+                "cannot construct ArenaKvWriter from read-only SharedMemoryArena".to_owned(),
+            ));
+        }
+        Self::from_arena_slice(arena.as_mut_slice())
+    }
+
+    /// Constructs an [`ArenaKvWriter`] directly from a [`KvCacheView`] and its backing
+    /// [`KvBlockMeta`] slice.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `seq_capacity` is not a multiple of
+    /// [`KV_BLOCK_TOKEN_CAPACITY`] or `block_meta` has fewer entries than sequence blocks.
+    pub fn from_parts(
+        kv_view: KvCacheView<'a>,
+        block_meta: &'a mut [KvBlockMeta],
+    ) -> Result<Self, KvError> {
+        let seq_capacity = kv_view.seq_capacity();
+        if seq_capacity % KV_BLOCK_TOKEN_CAPACITY != 0 {
+            return Err(KvError::InvalidDimensions(format!(
+                "seq_capacity ({seq_capacity}) must be a multiple of KV_BLOCK_TOKEN_CAPACITY ({KV_BLOCK_TOKEN_CAPACITY})"
+            )));
+        }
+        let logical_block_count = seq_capacity / KV_BLOCK_TOKEN_CAPACITY;
+        if block_meta.len() < logical_block_count {
+            return Err(KvError::InvalidDimensions(format!(
+                "block_meta len ({}) smaller than required logical blocks ({logical_block_count})",
+                block_meta.len()
+            )));
+        }
+        let meta_bytes = block_meta.as_mut_bytes();
+        validate_meta_slice_for_atomic(meta_bytes, logical_block_count)?;
+        Ok(Self {
+            kv_view,
+            meta_bytes,
+            logical_block_count,
+        })
+    }
+
+    /// Returns the validated [`KvGeometry`].
+    #[must_use]
+    pub const fn geometry(&self) -> KvGeometry {
+        self.kv_view.geometry()
+    }
+
+    /// Returns the maximum sequence token capacity (`seq_capacity`).
+    #[must_use]
+    pub const fn seq_capacity(&self) -> usize {
+        self.kv_view.seq_capacity()
+    }
+
+    /// Returns the per-position vector width (`n_heads_kv * head_dim`).
+    #[must_use]
+    pub const fn kv_dim(&self) -> usize {
+        self.kv_view.kv_dim()
+    }
+
+    /// Returns the number of 16-token blocks backing `seq_capacity`.
+    #[must_use]
+    pub const fn block_count(&self) -> usize {
+        self.logical_block_count
+    }
+
+    /// Returns shared access to the underlying [`KvCacheView`].
+    #[must_use]
+    pub const fn kv_cache_view(&self) -> &KvCacheView<'a> {
+        &self.kv_view
+    }
+
+    /// Returns mutable access to the underlying [`KvCacheView`].
+    #[must_use]
+    pub fn kv_cache_view_mut(&mut self) -> &mut KvCacheView<'a> {
+        &mut self.kv_view
+    }
+
+    /// Copies contiguous `[seq_len, kv_dim]` K and V batch slices for `layer` starting at
+    /// `start_pos` in a single copy per plane, returning contiguous `0..(start_pos + seq_len)`
+    /// `(k_prefix, v_prefix)` reader slices.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers`, `k_batch.len() != v_batch.len()`,
+    /// slice lengths are not multiples of `kv_dim`, or `start_pos + seq_len > seq_capacity`.
+    pub fn append_layer_batch(
+        &mut self,
+        layer: usize,
+        start_pos: usize,
+        k_batch: &[f32],
+        v_batch: &[f32],
+    ) -> Result<(&[f32], &[f32]), KvError> {
+        let geom = self.kv_view.geometry();
+        let kv_dim = self.kv_view.kv_dim();
+        if layer >= geom.num_layers {
+            return Err(KvError::InvalidDimensions(format!(
+                "layer index {layer} out of bounds for num_layers={}",
+                geom.num_layers
+            )));
+        }
+        if k_batch.len() != v_batch.len() {
+            return Err(KvError::InvalidDimensions(format!(
+                "k_batch len ({}) does not match v_batch len ({})",
+                k_batch.len(),
+                v_batch.len()
+            )));
+        }
+        if k_batch.len() % kv_dim != 0 {
+            return Err(KvError::InvalidDimensions(format!(
+                "k_batch len ({}) is not a multiple of kv_dim ({kv_dim})",
+                k_batch.len()
+            )));
+        }
+        let seq_len = k_batch.len() / kv_dim;
+        let end_pos = start_pos.checked_add(seq_len).ok_or_else(|| {
+            KvError::InvalidDimensions("append_layer_batch end_pos overflowed usize".to_owned())
+        })?;
+        if end_pos > geom.seq_capacity {
+            return Err(KvError::InvalidDimensions(format!(
+                "batch span [{start_pos}..{end_pos}) exceeds seq_capacity ({})",
+                geom.seq_capacity
+            )));
+        }
+        let elem_start = start_pos
+            .checked_mul(kv_dim)
+            .ok_or_else(|| KvError::InvalidDimensions("elem_start overflowed usize".to_owned()))?;
+        let elem_end = end_pos
+            .checked_mul(kv_dim)
+            .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
+
+        let (k_plane, v_plane) = self
+            .kv_view
+            .layer_kv_mut(layer)
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+        k_plane[elem_start..elem_end].copy_from_slice(k_batch);
+        v_plane[elem_start..elem_end].copy_from_slice(v_batch);
+        Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
+    }
+
+    /// Returns contiguous `0..end_pos` immutable `(k_prefix, v_prefix)` slices for `layer`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers` or `end_pos > seq_capacity`.
+    pub fn layer_kv_prefix(
+        &self,
+        layer: usize,
+        end_pos: usize,
+    ) -> Result<(&[f32], &[f32]), KvError> {
+        let seq_capacity = self.kv_view.seq_capacity();
+        if end_pos > seq_capacity {
+            return Err(KvError::InvalidDimensions(format!(
+                "end_pos ({end_pos}) exceeds seq_capacity ({seq_capacity})"
+            )));
+        }
+        let kv_dim = self.kv_view.kv_dim();
+        let elem_end = end_pos
+            .checked_mul(kv_dim)
+            .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
+        let (k_plane, v_plane) = self
+            .kv_view
+            .layer_kv(layer)
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+        Ok((&k_plane[..elem_end], &v_plane[..elem_end]))
+    }
+
+    /// Returns immutable `(k_valid, v_valid)` slices for `layer` up to `end_pos` (respecting
+    /// `sliding_window` when configured).
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers` or `end_pos > seq_capacity`.
+    pub fn valid_kv_range(
+        &self,
+        layer: usize,
+        end_pos: usize,
+    ) -> Result<(&[f32], &[f32]), KvError> {
+        self.kv_view
+            .valid_kv_range(layer, end_pos)
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))
+    }
+
+    /// Reads the `committed_token_count` for `block_idx` with `Acquire` ordering.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `block_idx >= block_count()`.
+    pub fn block_committed_tokens(&self, block_idx: usize) -> Result<u32, KvError> {
+        read_block_committed_tokens_from_slice(self.meta_bytes, block_idx, self.logical_block_count)
+    }
+
+    /// Computes the total contiguously committed token watermark across all 16-token blocks.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if any block exceeds 16 tokens or blocks are non-contiguous.
+    pub fn committed_tokens(&self) -> Result<usize, KvError> {
+        committed_watermark_from_meta(self.meta_bytes, self.logical_block_count)
+    }
+
+    /// Enforces monotonic contiguous progression (`start_pos == committed_tokens()`) and advances
+    /// [`KvBlockMeta::committed_token_count`] with `Release` ordering across all 16-token blocks
+    /// spanned by `[start_pos .. start_pos + seq_len)`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `start_pos != committed_tokens()`, `start_pos + seq_len`
+    /// overflows or exceeds `seq_capacity`, or existing block metadata is corrupted/non-contiguous.
+    pub fn commit_token_span(&mut self, start_pos: usize, seq_len: usize) -> Result<(), KvError> {
+        commit_token_span_in_meta(
+            self.meta_bytes,
+            self.logical_block_count,
+            self.kv_view.seq_capacity(),
+            start_pos,
+            seq_len,
+        )
+    }
+
+    /// Commits a batched prefill range `[start_pos .. start_pos + seq_len)` across spanned 16-token
+    /// blocks via [`Self::commit_token_span`].
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if [`Self::commit_token_span`] fails.
+    pub fn commit_prefill_range(
+        &mut self,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<(), KvError> {
+        self.commit_token_span(start_pos, seq_len)
+    }
+}
+
+/// Zero-copy read-only view over an initialized arena's KV cache slab and atomic [`KvBlockMeta`] table.
+#[derive(Debug)]
+pub struct ArenaKvReader<'a> {
+    kv_slab: &'a [f32],
+    meta_bytes: &'a [u8],
+    geometry: KvGeometry,
+    kv_dim: usize,
+    plane_len: usize,
+    logical_block_count: usize,
+}
+
+impl<'a> ArenaKvReader<'a> {
+    /// Wraps an initialized arena byte slice in a bounds-checked [`ArenaKvReader`].
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if header, KV slab, or metadata checks fail, or
+    /// [`KvError::IpcError`] if metadata alignment is invalid for `AtomicU32` loads.
+    pub fn from_arena_slice(arena_bytes: &'a [u8]) -> Result<Self, KvError> {
+        let slab = validate_arena_kv_slab(arena_bytes)?;
+        let (meta_offset, meta_end, logical_block_count) =
+            validate_arena_meta_bounds(arena_bytes, slab.geometry.seq_capacity, slab.kv_offset)?;
+        let meta_bytes = &arena_bytes[meta_offset..meta_end];
+        validate_meta_slice_for_atomic(meta_bytes, logical_block_count)?;
+
+        let kv_bytes = &arena_bytes[slab.kv_offset..slab.kv_end];
+        let kv_slab = <[f32]>::ref_from_bytes(kv_bytes).map_err(|err| {
+            KvError::InvalidDimensions(format!("KV slab byte slice conversion failed: {err:?}"))
+        })?;
+        let kv_dim = slab
+            .geometry
+            .kv_dim()
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+        let plane_len = slab
+            .geometry
+            .plane_len()
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+        let required = slab
+            .geometry
+            .required_f32_len()
+            .map_err(|err| KvError::InvalidDimensions(err.to_string()))?;
+        if kv_slab.len() < required {
+            return Err(KvError::InvalidDimensions(format!(
+                "KV slab f32 length ({}) smaller than required ({required})",
+                kv_slab.len()
+            )));
+        }
+
+        Ok(Self {
+            kv_slab: &kv_slab[..required],
+            meta_bytes,
+            geometry: slab.geometry,
+            kv_dim,
+            plane_len,
+            logical_block_count,
+        })
+    }
+
+    /// Wraps a [`SharedMemoryArena`] in a read-only [`ArenaKvReader`].
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if header, KV slab, or metadata validation fails.
+    pub fn from_arena(arena: &'a SharedMemoryArena) -> Result<Self, KvError> {
+        Self::from_arena_slice(arena.as_slice())
+    }
+
+    /// Returns the validated [`KvGeometry`].
+    #[must_use]
+    pub const fn geometry(&self) -> KvGeometry {
+        self.geometry
+    }
+
+    /// Returns the number of transformer KV layers.
+    #[must_use]
+    pub const fn num_layers(&self) -> usize {
+        self.geometry.num_layers
+    }
+
+    /// Returns the maximum sequence token capacity (`seq_capacity`).
+    #[must_use]
+    pub const fn seq_capacity(&self) -> usize {
+        self.geometry.seq_capacity
+    }
+
+    /// Returns the per-position vector width (`n_heads_kv * head_dim`).
+    #[must_use]
+    pub const fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    /// Returns the length of a single K or V plane (`seq_capacity * kv_dim`).
+    #[must_use]
+    pub const fn plane_len(&self) -> usize {
+        self.plane_len
+    }
+
+    /// Returns the number of 16-token blocks backing `seq_capacity`.
+    #[must_use]
+    pub const fn block_count(&self) -> usize {
+        self.logical_block_count
+    }
+
+    /// Returns immutable `(k_plane, v_plane)` slices covering full `[0..seq_capacity)` for `layer`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()`.
+    pub fn layer_kv(&self, layer: usize) -> Result<(&'a [f32], &'a [f32]), KvError> {
+        if layer >= self.geometry.num_layers {
+            return Err(KvError::InvalidDimensions(format!(
+                "layer index {layer} out of bounds for num_layers={}",
+                self.geometry.num_layers
+            )));
+        }
+        let k_start = layer * 2 * self.plane_len;
+        let v_start = k_start + self.plane_len;
+        let layer_end = v_start + self.plane_len;
+        Ok((
+            &self.kv_slab[k_start..v_start],
+            &self.kv_slab[v_start..layer_end],
+        ))
+    }
+
+    /// Returns immutable `(k_slice, v_slice)` covering `[start_pos..end_pos)` for `layer`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()`, `start_pos > end_pos`,
+    /// or `end_pos > seq_capacity()`.
+    pub fn layer_kv_range(
+        &self,
+        layer: usize,
+        start_pos: usize,
+        end_pos: usize,
+    ) -> Result<(&'a [f32], &'a [f32]), KvError> {
+        if start_pos > end_pos {
+            return Err(KvError::InvalidDimensions(format!(
+                "start_pos ({start_pos}) > end_pos ({end_pos})"
+            )));
+        }
+        if end_pos > self.geometry.seq_capacity {
+            return Err(KvError::InvalidDimensions(format!(
+                "end_pos ({end_pos}) exceeds seq_capacity ({})",
+                self.geometry.seq_capacity
+            )));
+        }
+        let (k_plane, v_plane) = self.layer_kv(layer)?;
+        let elem_start = start_pos
+            .checked_mul(self.kv_dim)
+            .ok_or_else(|| KvError::InvalidDimensions("elem_start overflowed usize".to_owned()))?;
+        let elem_end = end_pos
+            .checked_mul(self.kv_dim)
+            .ok_or_else(|| KvError::InvalidDimensions("elem_end overflowed usize".to_owned()))?;
+        Ok((
+            &k_plane[elem_start..elem_end],
+            &v_plane[elem_start..elem_end],
+        ))
+    }
+
+    /// Returns immutable `(k_prefix, v_prefix)` slices covering `0..end_pos` for `layer`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()` or `end_pos > seq_capacity()`.
+    pub fn layer_kv_prefix(
+        &self,
+        layer: usize,
+        end_pos: usize,
+    ) -> Result<(&'a [f32], &'a [f32]), KvError> {
+        self.layer_kv_range(layer, 0, end_pos)
+    }
+
+    /// Returns immutable `(k_valid, v_valid)` slices up to `end_pos` (respecting `sliding_window`
+    /// when configured).
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `layer >= num_layers()` or `end_pos > seq_capacity()`.
+    pub fn valid_kv_range(
+        &self,
+        layer: usize,
+        end_pos: usize,
+    ) -> Result<(&'a [f32], &'a [f32]), KvError> {
+        let start_pos = match self.geometry.sliding_window {
+            Some(window) => end_pos.saturating_sub(window),
+            None => 0,
+        };
+        self.layer_kv_range(layer, start_pos, end_pos)
+    }
+
+    /// Reads the current committed watermark and returns `valid_kv_range(layer, committed_tokens)`.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if metadata is corrupt/non-contiguous or `layer >= num_layers()`.
+    pub fn committed_kv_range(&self, layer: usize) -> Result<(&'a [f32], &'a [f32]), KvError> {
+        let committed = self.committed_tokens()?;
+        self.valid_kv_range(layer, committed)
+    }
+
+    /// Reads the `committed_token_count` for `block_idx` with `Acquire` ordering.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if `block_idx >= block_count()`.
+    pub fn block_committed_tokens(&self, block_idx: usize) -> Result<u32, KvError> {
+        read_block_committed_tokens_from_slice(self.meta_bytes, block_idx, self.logical_block_count)
+    }
+
+    /// Computes the total contiguously committed token watermark across all 16-token blocks.
+    ///
+    /// # Errors
+    /// Returns [`KvError::InvalidDimensions`] if any block exceeds 16 tokens or blocks are non-contiguous.
+    pub fn committed_tokens(&self) -> Result<usize, KvError> {
+        committed_watermark_from_meta(self.meta_bytes, self.logical_block_count)
+    }
+}
+
+/// Constructs a bounds-checked [`KvCacheView`] over an initialized arena byte buffer.
+///
+/// Exposed alongside [`ArenaHandle`] so layer-major `[layer][K|V][pos][kv_dim]` invariants can
+/// also be verified directly under Miri without OS `memfd_create` / `mmap` syscalls.
+///
+/// # Errors
+/// Returns [`KvError::InvalidDimensions`] if header validation fails, geometry or dtype checks
+/// fail, or the exact KV slab range violates header region bounds or `f32` alignment.
+pub fn kv_cache_view_from_arena_slice_mut(
+    arena_bytes: &mut [u8],
+) -> Result<KvCacheView<'_>, KvError> {
+    let slab = validate_arena_kv_slab(arena_bytes)?;
+    let kv_bytes = &mut arena_bytes[slab.kv_offset..slab.kv_end];
     let kv_f32s = <[f32]>::mut_from_bytes(kv_bytes).map_err(|err| {
         KvError::InvalidDimensions(format!("KV slab byte slice conversion failed: {err:?}"))
     })?;
-    KvCacheView::new(kv_f32s, geometry).map_err(|err| KvError::InvalidDimensions(err.to_string()))
+    KvCacheView::new(kv_f32s, slab.geometry)
+        .map_err(|err| KvError::InvalidDimensions(err.to_string()))
 }
 
 #[cfg(test)]
@@ -2365,5 +3137,305 @@ mod tests {
         assert_eq!(v_valid.len(), 21 * 1024);
         assert_eq!(k_valid[20 * 1024], 21.0);
         assert_eq!(v_valid[20 * 1024], -21.0);
+    }
+
+    #[repr(C, align(64))]
+    #[derive(Clone, Copy, FromBytes, IntoBytes, zerocopy::Immutable)]
+    struct AlignedArenaLine([u8; 64]);
+
+    fn build_in_memory_kv_arena(
+        n_ctx: u32,
+        head_dim: u32,
+        num_layers: u32,
+        head_count_kv: u32,
+    ) -> (
+        ArenaAllocationConfig,
+        ComputedArenaLayout,
+        Vec<AlignedArenaLine>,
+    ) {
+        let cfg = ArenaAllocationConfig::new("wave3-batched-prefill", n_ctx, head_dim, num_layers)
+            .with_head_count_kv(head_count_kv)
+            .with_vocab_size(64)
+            .with_kv_dtype(KV_DTYPE_F32);
+        let layout = compute_arena_layout(&cfg).expect("valid layout");
+        let total_usize = usize::try_from(layout.total_bytes).expect("total_bytes fits usize");
+        let lines = total_usize.div_ceil(64);
+        let mut backing = vec![AlignedArenaLine([0_u8; 64]); lines];
+        let arena_bytes = backing.as_mut_bytes();
+        {
+            let (hdr_mut, _) =
+                ArenaHeader::mut_from_prefix(&mut arena_bytes[..total_usize]).expect("header");
+            populate_arena_header(hdr_mut, layout.total_bytes, &cfg, &layout)
+                .expect("populate ArenaHeader");
+        }
+        let meta_start = usize::try_from(layout.meta_table_offset).expect("meta_table_offset");
+        let entry_size = size_of::<KvBlockMeta>();
+        for idx in 0..usize::try_from(layout.block_count).expect("block_count") {
+            let block_id = u32::try_from(idx).expect("block_id fits u32");
+            let off = meta_start + idx * entry_size;
+            let meta = KvBlockMeta::mut_from_bytes(&mut arena_bytes[off..off + entry_size])
+                .expect("KvBlockMeta");
+            meta.block_id = block_id;
+            meta.tag = jero_core::ipc::layout::TAG_VOLATILE;
+            meta.refcount = 1;
+            meta.committed_token_count = 0;
+        }
+        (cfg, layout, backing)
+    }
+
+    fn make_batch_vectors(
+        layer: usize,
+        start_pos: usize,
+        seq_len: usize,
+        kv_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut k = Vec::with_capacity(seq_len * kv_dim);
+        let mut v = Vec::with_capacity(seq_len * kv_dim);
+        for rel in 0..seq_len {
+            let pos = start_pos + rel;
+            for d in 0..kv_dim {
+                let k_code = u16::try_from(layer * 5000 + pos * 16 + d).expect("k_code fits u16");
+                let k_val = f32::from(k_code) + 0.25;
+                k.push(k_val);
+                v.push(-k_val - 0.5);
+            }
+        }
+        (k, v)
+    }
+
+    #[test]
+    fn test_batched_append_layer_batch_non_power_of_two_chunks_and_bounds() {
+        // n_ctx = 60 -> seq_capacity = 64 (4 blocks of 16), kv_dim = 2 * 4 = 8.
+        let (_, _, mut backing) = build_in_memory_kv_arena(60, 4, 2, 2);
+        let arena_bytes = backing.as_mut_bytes();
+
+        let mut writer =
+            ArenaKvWriter::from_arena_slice(arena_bytes).expect("construct ArenaKvWriter");
+        assert_eq!(writer.seq_capacity(), 64);
+        assert_eq!(writer.kv_dim(), 8);
+        assert_eq!(writer.block_count(), 4);
+
+        let chunk_lens = [1_usize, 7, 16, 33]; // total = 57 tokens
+        for layer in 0..2 {
+            let mut cursor = 0_usize;
+            for &seq_len in &chunk_lens {
+                let (k_batch, v_batch) = make_batch_vectors(layer, cursor, seq_len, 8);
+                let end_pos = cursor + seq_len;
+                let (k_prefix, v_prefix) = writer
+                    .append_layer_batch(layer, cursor, &k_batch, &v_batch)
+                    .expect("append chunk");
+                assert_eq!(k_prefix.len(), end_pos * 8);
+                assert_eq!(v_prefix.len(), end_pos * 8);
+
+                // Verify entire 0..end_pos prefix matches deterministic marker values.
+                let (expected_k, expected_v) = make_batch_vectors(layer, 0, end_pos, 8);
+                assert_eq!(k_prefix, expected_k.as_slice());
+                assert_eq!(v_prefix, expected_v.as_slice());
+
+                cursor = end_pos;
+            }
+            assert_eq!(cursor, 57);
+        }
+
+        // Fail-closed boundary paths before mutating any state:
+        let (k_8, v_8) = make_batch_vectors(0, 57, 8, 8);
+        assert!(matches!(
+            writer.append_layer_batch(0, 57, &k_8, &v_8),
+            Err(KvError::InvalidDimensions(_))
+        )); // 57 + 8 = 65 > seq_capacity (64)
+        assert!(matches!(
+            writer.append_layer_batch(2, 0, &k_8, &v_8),
+            Err(KvError::InvalidDimensions(_))
+        )); // layer 2 out of bounds
+        assert!(matches!(
+            writer.append_layer_batch(0, 57, &k_8, &v_8[..v_8.len() - 8]),
+            Err(KvError::InvalidDimensions(_))
+        )); // mismatched k_batch / v_batch lengths
+        assert!(matches!(
+            writer.append_layer_batch(0, 57, &k_8[..7], &v_8[..7]),
+            Err(KvError::InvalidDimensions(_))
+        )); // non-multiple of kv_dim
+        assert!(matches!(
+            writer.append_layer_batch(0, usize::MAX, &k_8, &v_8),
+            Err(KvError::InvalidDimensions(_))
+        )); // overflow guard
+
+        // Ensure trailing positions [57..64) stayed zeroed after failed overflow append.
+        let reader = ArenaKvReader::from_arena_slice(backing.as_bytes()).expect("ArenaKvReader");
+        for layer in 0..2 {
+            let (k_tail, v_tail) = reader.layer_kv_range(layer, 57, 64).expect("tail range");
+            assert!(k_tail.iter().all(|&x| x == 0.0));
+            assert!(v_tail.iter().all(|&x| x == 0.0));
+        }
+    }
+
+    #[test]
+    fn test_commit_token_span_across_block_boundaries_miri() {
+        // Part 1: exact progression 0..15, 15..16, 16..40 across 3 16-token blocks (seq_capacity = 48).
+        {
+            let (_, _, mut backing) = build_in_memory_kv_arena(48, 4, 2, 1);
+            {
+                let mut writer =
+                    ArenaKvWriter::from_arena_slice(backing.as_mut_bytes()).expect("writer");
+                assert_eq!(writer.block_count(), 3);
+                assert_eq!(writer.committed_tokens().expect("initial watermark"), 0);
+
+                // 0..15 -> [15, 0, 0]
+                writer.commit_token_span(0, 15).expect("commit 0..15");
+                assert_eq!(writer.block_committed_tokens(0).unwrap(), 15);
+                assert_eq!(writer.block_committed_tokens(1).unwrap(), 0);
+                assert_eq!(writer.block_committed_tokens(2).unwrap(), 0);
+                assert_eq!(writer.committed_tokens().unwrap(), 15);
+
+                // Reject gaps, overlaps, and out-of-bounds spans without mutating blocks.
+                assert!(writer.commit_token_span(16, 1).is_err());
+                assert!(writer.commit_token_span(14, 2).is_err());
+                assert!(writer.commit_token_span(0, 15).is_err());
+                assert_eq!(writer.block_committed_tokens(0).unwrap(), 15);
+
+                // 15..16 -> [16, 0, 0]
+                writer.commit_token_span(15, 1).expect("commit 15..16");
+                assert_eq!(writer.block_committed_tokens(0).unwrap(), 16);
+                assert_eq!(writer.block_committed_tokens(1).unwrap(), 0);
+                assert_eq!(writer.block_committed_tokens(2).unwrap(), 0);
+                assert_eq!(writer.committed_tokens().unwrap(), 16);
+
+                // 16..40 -> [16, 16, 8]
+                writer.commit_token_span(16, 24).expect("commit 16..40");
+                assert_eq!(writer.block_committed_tokens(0).unwrap(), 16);
+                assert_eq!(writer.block_committed_tokens(1).unwrap(), 16);
+                assert_eq!(writer.block_committed_tokens(2).unwrap(), 8);
+                assert_eq!(writer.committed_tokens().unwrap(), 40);
+
+                // Out-of-bounds beyond seq_capacity=48 fails closed.
+                assert!(writer.commit_token_span(40, 9).is_err());
+                assert_eq!(writer.committed_tokens().unwrap(), 40);
+            }
+
+            let reader = ArenaKvReader::from_arena_slice(backing.as_bytes()).expect("reader");
+            assert_eq!(reader.block_committed_tokens(0).unwrap(), 16);
+            assert_eq!(reader.block_committed_tokens(1).unwrap(), 16);
+            assert_eq!(reader.block_committed_tokens(2).unwrap(), 8);
+            assert_eq!(reader.committed_tokens().unwrap(), 40);
+            assert!(reader.block_committed_tokens(3).is_err());
+        }
+
+        // Part 2: chunked prefill 0..128, 128..256, 256..300 (n_ctx = 300 -> seq_capacity = 304, 19 blocks).
+        {
+            let (_, _, mut backing) = build_in_memory_kv_arena(300, 2, 2, 2);
+            let chunks = [(0_usize, 128_usize), (128, 128), (256, 44)];
+            for &(start_pos, seq_len) in &chunks {
+                {
+                    let mut writer =
+                        ArenaKvWriter::from_arena_slice(backing.as_mut_bytes()).expect("writer");
+                    for layer in 0..2 {
+                        let (k_batch, v_batch) = make_batch_vectors(layer, start_pos, seq_len, 4);
+                        let (k_pref, _) = writer
+                            .append_layer_batch(layer, start_pos, &k_batch, &v_batch)
+                            .expect("append chunk");
+                        assert_eq!(k_pref.len(), (start_pos + seq_len) * 4);
+                    }
+                    writer
+                        .commit_prefill_range(start_pos, seq_len)
+                        .expect("commit prefill chunk");
+                }
+                let reader = ArenaKvReader::from_arena_slice(backing.as_bytes()).expect("reader");
+                assert_eq!(reader.committed_tokens().unwrap(), start_pos + seq_len);
+            }
+
+            let reader = ArenaKvReader::from_arena_slice(backing.as_bytes()).expect("reader");
+            assert_eq!(reader.block_count(), 19);
+            assert_eq!(reader.committed_tokens().unwrap(), 300);
+            for b in 0..18 {
+                assert_eq!(reader.block_committed_tokens(b).unwrap(), 16);
+            }
+            assert_eq!(reader.block_committed_tokens(18).unwrap(), 12);
+
+            for layer in 0..2 {
+                let (k_commit, v_commit) = reader
+                    .committed_kv_range(layer)
+                    .expect("committed_kv_range");
+                let (expected_k, expected_v) = make_batch_vectors(layer, 0, 300, 4);
+                assert_eq!(k_commit, expected_k.as_slice());
+                assert_eq!(v_commit, expected_v.as_slice());
+            }
+        }
+
+        // Part 3: ArenaKvWriter::from_parts & corrupted non-contiguous metadata rejection.
+        {
+            let geom = KvGeometry::new(1, 1, 4, 32, None).expect("geom");
+            let mut kv_buf = vec![0.0_f32; geom.required_f32_len().unwrap()];
+            let mut metas = [KvBlockMeta::new(0, 15), KvBlockMeta::new(1, 2)];
+            let view = KvCacheView::new(&mut kv_buf, geom).expect("view");
+            let mut writer = ArenaKvWriter::from_parts(view, &mut metas).expect("from_parts");
+            assert!(matches!(
+                writer.committed_tokens(),
+                Err(KvError::InvalidDimensions(_))
+            ));
+            assert!(matches!(
+                writer.commit_token_span(17, 1),
+                Err(KvError::InvalidDimensions(_))
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_arena_handle_batched_prefill_roundtrip() {
+        let holder = KvHolder::new();
+        let cfg = ArenaAllocationConfig::new("qwen-wave3-prefill", 300, 4, 2)
+            .with_head_count_kv(2)
+            .with_vocab_size(128)
+            .with_kv_dtype(KV_DTYPE_F32);
+        let alloc = holder.allocate(&cfg).expect("allocate wave3 arena");
+
+        let writable_fd = holder.get_arena_fd(alloc.arena_id).expect("writable fd");
+        let readonly_fd = holder.get_arena_fd(alloc.arena_id).expect("readonly fd");
+        let len = usize::try_from(alloc.total_bytes).expect("arena len fits usize");
+
+        let mut rw = SharedMemoryArena::from_existing_fd(writable_fd, len, "test_wave3_rw", false)
+            .expect("rw mapping");
+        let mut ro = SharedMemoryArena::from_existing_fd(readonly_fd, len, "test_wave3_ro", true)
+            .expect("ro mapping");
+
+        // Read-only arena rejects mutable writer cleanly without panicking.
+        assert!(matches!(
+            ArenaKvWriter::from_arena(&mut ro),
+            Err(KvError::IpcError(_))
+        ));
+
+        let mut handle = ArenaHandle::new(&mut rw).expect("ArenaHandle");
+        let chunks = [(0_usize, 128_usize), (128, 128), (256, 44)];
+        for &(start_pos, seq_len) in &chunks {
+            {
+                let mut writer = handle.kv_writer().expect("kv_writer");
+                for layer in 0..2 {
+                    let (k_batch, v_batch) = make_batch_vectors(layer, start_pos, seq_len, 8);
+                    let (k_pref, v_pref) = writer
+                        .append_layer_batch(layer, start_pos, &k_batch, &v_batch)
+                        .expect("append chunk via ArenaHandle");
+                    assert_eq!(k_pref.len(), (start_pos + seq_len) * 8);
+                    assert_eq!(v_pref.len(), (start_pos + seq_len) * 8);
+                }
+            }
+            handle
+                .commit_prefill_range(start_pos, seq_len)
+                .expect("commit_prefill_range");
+            assert_eq!(
+                handle.committed_tokens().expect("committed_tokens"),
+                start_pos + seq_len
+            );
+        }
+
+        let ro_reader = ArenaKvReader::from_arena(&ro).expect("ro ArenaKvReader");
+        assert_eq!(ro_reader.committed_tokens().unwrap(), 300);
+        for b in 0..18 {
+            assert_eq!(ro_reader.block_committed_tokens(b).unwrap(), 16);
+        }
+        assert_eq!(ro_reader.block_committed_tokens(18).unwrap(), 12);
+        let (k_all, v_all) = ro_reader.committed_kv_range(1).expect("committed layer 1");
+        let (expected_k, expected_v) = make_batch_vectors(1, 0, 300, 8);
+        assert_eq!(k_all, expected_k.as_slice());
+        assert_eq!(v_all, expected_v.as_slice());
     }
 }
