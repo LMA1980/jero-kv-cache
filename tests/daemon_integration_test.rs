@@ -23,6 +23,25 @@ fn generate_test_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("jero_kv_test_{}_{}.sock", std::process::id(), id))
 }
 
+fn default_test_alloc_request(
+    model_id: &str,
+    arena_bytes: u64,
+    n_ctx: u32,
+    max_blocks: u32,
+) -> IpcMessage {
+    IpcMessage::AllocateArenaRequest(AllocateArenaRequest {
+        model_id: model_id.to_owned(),
+        arena_bytes,
+        n_ctx,
+        max_blocks,
+        num_layers: 2,
+        head_count_kv: 2,
+        head_dim: 64,
+        vocab_size: 32_000,
+        kv_dtype: 0,
+    })
+}
+
 /// Helper struct that spawns and supervises a test daemon process with automatic cleanup.
 struct DaemonHarness {
     socket_path: PathBuf,
@@ -206,12 +225,7 @@ fn test_daemon_arena_allocation_scm_rights_reception_and_mutation() {
     let stream = UnixStream::connect(&socket).expect("connect client 1");
 
     // 1. Allocate arena
-    let alloc_req = IpcMessage::AllocateArenaRequest(AllocateArenaRequest {
-        model_id: "qwen2.5-7b-instruct".to_owned(),
-        arena_bytes: 32 * 1024 * 1024, // 32 MiB
-        n_ctx: 512,
-        max_blocks: 32,
-    });
+    let alloc_req = default_test_alloc_request("qwen2.5-7b-instruct", 32 * 1024 * 1024, 512, 32);
     send_msg_frame(&stream, &alloc_req, None).expect("send alloc request");
 
     let (alloc_resp, _) = recv_msg_frame(&stream).expect("recv alloc response");
@@ -340,12 +354,7 @@ fn test_daemon_memlock_ceiling_rejection() {
     let stream = UnixStream::connect(&socket).expect("connect client");
 
     // Request 128 MiB (exceeds 64 MiB ceiling)
-    let oversize_req = IpcMessage::AllocateArenaRequest(AllocateArenaRequest {
-        model_id: "oversized-model".to_owned(),
-        arena_bytes: 128 * 1024 * 1024,
-        n_ctx: 1024,
-        max_blocks: 64,
-    });
+    let oversize_req = default_test_alloc_request("oversized-model", 128 * 1024 * 1024, 1024, 64);
     send_msg_frame(&stream, &oversize_req, None).expect("send oversized request");
 
     let (response, _) = recv_msg_frame(&stream).expect("recv response");

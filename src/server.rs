@@ -361,12 +361,7 @@ pub fn dispatch_single_request(
                 DispatchError::ProtocolError(format!("Corrupt AllocateArenaRequest: {e}"))
             })?;
 
-            let resp = match holder.allocate_arena(
-                &req.model_id,
-                req.arena_bytes,
-                req.n_ctx,
-                req.max_blocks,
-            ) {
+            let resp = match holder.allocate_from_request(&req) {
                 Ok(res) => AllocateArenaResponse {
                     arena_id: res.arena_id,
                     arena_bytes: res.total_bytes,
@@ -490,6 +485,11 @@ mod tests {
                 arena_bytes: 1024 * 1024,
                 n_ctx: 64,
                 max_blocks: 4,
+                num_layers: 2,
+                head_count_kv: 2,
+                head_dim: 64,
+                vocab_size: 32_000,
+                kv_dtype: 0,
             })
             .expect("serialize alloc");
         let (resp_alloc, fd_alloc) =
@@ -573,6 +573,11 @@ mod tests {
             arena_bytes: 1024 * 1024,
             n_ctx: 128,
             max_blocks: 8,
+            num_layers: 2,
+            head_count_kv: 2,
+            head_dim: 64,
+            vocab_size: 32_000,
+            kv_dtype: 0,
         });
         send_msg_frame(&client_stream, &alloc, None).unwrap();
         let (resp_alloc, _) = recv_msg_frame(&client_stream).unwrap();
@@ -634,6 +639,11 @@ mod tests {
             arena_bytes: 256 * 1024,
             n_ctx: 64,
             max_blocks: 4,
+            num_layers: 2,
+            head_count_kv: 2,
+            head_dim: 64,
+            vocab_size: 32_000,
+            kv_dtype: 0,
         });
         send_msg_frame(&client_stream, &alloc, None).unwrap();
         let (resp_alloc, _) = recv_msg_frame(&client_stream).unwrap();
@@ -705,6 +715,11 @@ mod tests {
             arena_bytes: 100 * 1024 * 1024,
             n_ctx: 1024,
             max_blocks: 64,
+            num_layers: 2,
+            head_count_kv: 2,
+            head_dim: 64,
+            vocab_size: 32_000,
+            kv_dtype: 0,
         });
         send_msg_frame(&client_stream, &alloc, None).unwrap();
         let (resp, _) = recv_msg_frame(&client_stream).unwrap();
@@ -865,6 +880,11 @@ mod tests {
                     arena_bytes: 65536,
                     n_ctx: 64,
                     max_blocks: 4,
+                    num_layers: 2,
+                    head_count_kv: 2,
+                    head_dim: 64,
+                    vocab_size: 32_000,
+                    kv_dtype: 0,
                 });
                 send_msg_frame(&client, &req, None).unwrap();
                 let (resp, _) = recv_msg_frame(&client).unwrap();
@@ -970,6 +990,141 @@ mod tests {
         }
 
         drop(client);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    fn verify_uds_real_geometry_kv_view(client: &UnixStream) {
+        use crate::holder::{ArenaHandle, arena_kv_dtype, arena_seq_capacity};
+        use jero_core::ipc::layout::ArenaHeader;
+        use jero_core::ipc::protocol::KV_DTYPE_F32;
+        use zerocopy::FromBytes;
+
+        // Verify fail-closed rejection when any model geometry field is zero.
+        let bad_req = IpcMessage::AllocateArenaRequest(AllocateArenaRequest {
+            model_id: "invalid-zero-dims".to_owned(),
+            arena_bytes: 16 * 1024 * 1024,
+            n_ctx: 20,
+            max_blocks: 2,
+            num_layers: 0,
+            head_count_kv: 8,
+            head_dim: 128,
+            vocab_size: 128_256,
+            kv_dtype: KV_DTYPE_F32,
+        });
+        send_msg_frame(client, &bad_req, None).unwrap();
+        let (bad_resp, _) = recv_msg_frame(client).unwrap();
+        assert!(matches!(
+            bad_resp,
+            IpcMessage::AllocateArenaResponse(r) if r.status != StatusCode::Success && r.arena_id == 0
+        ));
+
+        // Allocate with authentic Qwen2.5-7B geometry over UDS.
+        let alloc = IpcMessage::AllocateArenaRequest(AllocateArenaRequest {
+            model_id: "qwen2.5-7b-real-geom".to_owned(),
+            arena_bytes: 16 * 1024 * 1024,
+            n_ctx: 20,
+            max_blocks: 2,
+            num_layers: 28,
+            head_count_kv: 8,
+            head_dim: 128,
+            vocab_size: 128_256,
+            kv_dtype: KV_DTYPE_F32,
+        });
+        send_msg_frame(client, &alloc, None).unwrap();
+        let (resp_alloc, _) = recv_msg_frame(client).unwrap();
+        let (arena_id, total_bytes) = match resp_alloc {
+            IpcMessage::AllocateArenaResponse(r) => {
+                assert_eq!(r.status, StatusCode::Success, "{:?}", r.error_message);
+                (r.arena_id, r.arena_bytes)
+            }
+            other => panic!("expected AllocateArenaResponse, got {other:?}"),
+        };
+
+        let get_fd = IpcMessage::GetArenaFdRequest(GetArenaFdRequest { arena_id });
+        send_msg_frame(client, &get_fd, None).unwrap();
+        let (resp_fd, opt_fd) = recv_msg_frame(client).unwrap();
+        assert!(matches!(
+            resp_fd,
+            IpcMessage::GetArenaFdResponse(r) if r.status == StatusCode::Success
+        ));
+        let fd = opt_fd.expect("SCM_RIGHTS FD missing");
+        let len = usize::try_from(total_bytes).expect("arena len fits usize");
+        let mut client_arena = SharedMemoryArena::from_existing_fd(fd, len, "uds_real_geom", false)
+            .expect("map received FD");
+
+        {
+            let (hdr, _) = ArenaHeader::ref_from_prefix(client_arena.as_slice()).unwrap();
+            assert_eq!(hdr.num_layers, 28);
+            assert_eq!(hdr.head_count_kv, 8);
+            assert_eq!(hdr.head_dim, 128);
+            assert_eq!(hdr.vocab_size, 128_256);
+            assert_eq!(hdr.n_ctx, 20);
+            assert_eq!(arena_seq_capacity(hdr), 32);
+            assert_eq!(arena_kv_dtype(hdr), KV_DTYPE_F32);
+        }
+
+        {
+            let mut arena_handle = ArenaHandle::new(&mut client_arena).expect("ArenaHandle");
+            let mut view = arena_handle
+                .kv_cache_view_mut()
+                .expect("contiguous KvCacheView");
+            for pos in 0..=20 {
+                let marker = f32::from(u16::try_from(pos + 100).unwrap());
+                let (k, v) = view.write_pos_range(13, pos).expect("write layer 13");
+                k.fill(marker);
+                v.fill(-marker);
+            }
+            let (k_hist, v_hist) = view.valid_kv_range(13, 21).expect("read layer 13 0..=20");
+            assert_eq!(k_hist.len(), 21 * 1024);
+            assert_eq!(v_hist.len(), 21 * 1024);
+            assert_eq!(k_hist[0], 100.0);
+            assert_eq!(k_hist[20 * 1024], 120.0);
+            assert_eq!(v_hist[20 * 1024], -120.0);
+        }
+
+        let dealloc = IpcMessage::DeallocateArenaRequest(DeallocateArenaRequest { arena_id });
+        send_msg_frame(client, &dealloc, None).unwrap();
+        let (resp_dealloc, _) = recv_msg_frame(client).unwrap();
+        assert!(matches!(
+            resp_dealloc,
+            IpcMessage::DeallocateArenaResponse(r) if r.status == StatusCode::Success
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)]
+    async fn test_uds_allocate_arena_hydrates_real_model_geometry_and_kv_view() {
+        let tmp_dir = std::env::temp_dir().join(format!("jero_kv_geom_uds_{}", std::process::id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let sock_path = tmp_dir.join("jero-kv-cache.sock");
+
+        let config = ServerConfig {
+            socket_path: sock_path.clone(),
+            max_memory_bytes: 256 * 1024 * 1024,
+        };
+        let server = Arc::new(KvServer::new(config));
+        let server_clone = Arc::clone(&server);
+
+        let handle = tokio::spawn(async move {
+            server_clone.run().await.unwrap();
+        });
+
+        let mut client_opt = None;
+        for _ in 0..50 {
+            if sock_path.exists() {
+                if let Ok(client) = UnixStream::connect(&sock_path) {
+                    client_opt = Some(client);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let client = client_opt.expect("client must connect");
+        verify_uds_real_geometry_kv_view(&client);
+
+        drop(client);
+        server.shutdown();
+        handle.await.unwrap();
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
