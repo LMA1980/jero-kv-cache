@@ -14,7 +14,9 @@ pub mod server;
 
 pub use holder::{
     ArenaAllocationConfig, ArenaAllocationResult, ComputedArenaLayout, KvError, KvHolder,
-    LayerKvPolicy, compute_arena_layout, compute_hybrid_kv_block_count,
+    LayerKvPolicy, commit_recurrent_step_in_arena, commit_recurrent_step_in_region,
+    compute_arena_layout, compute_hybrid_kv_block_count, read_recurrent_slot_header_from_region,
+    recurrent_banks_from_region_mut, recurrent_banks_in_arena_mut, recurrent_region_offset,
 };
 pub use server::{
     DEFAULT_SOCKET_PATH, KvServer, ServerConfig, SocketFileGuard, handle_connection,

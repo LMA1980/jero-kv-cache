@@ -29,8 +29,11 @@ use jero_core::ipc::layout::{
     TAG_FREE, TAG_PERSIST, TokenInputSlotHeader,
 };
 use jero_core::ipc::protocol::StatusCode;
-use jero_core::ipc::shm::system_page_size;
-use jero_kv_cache::holder::{ArenaAllocationConfig, KvError, KvHolder, compute_arena_layout};
+use jero_core::ipc::shm::{SharedMemoryArena, system_page_size};
+use jero_kv_cache::holder::{
+    ArenaAllocationConfig, KvError, KvHolder, commit_recurrent_step_in_arena, compute_arena_layout,
+    recurrent_banks_in_arena_mut,
+};
 
 /// Helper to count currently open file descriptors for leak verification.
 fn count_open_fds() -> usize {
@@ -512,13 +515,9 @@ fn test_challenge_physical_memory_pointer_alignment_and_mutation_isolation() {
     // 3. In-place mutation and cross-region isolation test
     // Mutate block 0 and verify other regions are untouched
     let fd = holder.get_arena_fd(res.arena_id).expect("fd");
-    let mut mut_view = jero_core::ipc::shm::SharedMemoryArena::from_existing_fd(
-        fd,
-        res.total_bytes as usize,
-        "mut_view",
-        false,
-    )
-    .expect("mutable mapping view");
+    let mut mut_view =
+        SharedMemoryArena::from_existing_fd(fd, res.total_bytes as usize, "mut_view", false)
+            .expect("mutable mapping view");
 
     // Mutate block 0 metadata
     {
@@ -741,4 +740,77 @@ fn test_challenge_daemon_sigterm_graceful_shutdown_with_connected_client() {
         Some(0),
         "Daemon should exit with code 0 on SIGTERM"
     );
+}
+
+#[test]
+fn test_recurrent_untorn_recovery() {
+    let holder = KvHolder::new();
+
+    // 1. O(1) pure recurrent sizing across 32x context window growth
+    let rec_small = ArenaAllocationConfig::new_recurrent("mamba2", 512, 4096, 8, 128, 512);
+    let rec_large = ArenaAllocationConfig::new_recurrent("mamba2", 16_384, 4096, 8, 128, 512);
+    let small_res = holder.allocate(&rec_small).expect("allocate rec_small");
+    let large_res = holder.allocate(&rec_large).expect("allocate rec_large");
+    assert_eq!(small_res.block_count, 0);
+    assert_eq!(large_res.block_count, 0);
+    assert_eq!(small_res.total_bytes, large_res.total_bytes);
+
+    // 2. Hybrid SSM + Transformer arena allocation with multi-step commit & crash rollback
+    let hybrid_cfg = ArenaAllocationConfig::new("jamba_hybrid", 256, 64, 4)
+        .with_head_count_kv(2)
+        .with_vocab_size(4096)
+        .with_recurrent_state(6, 128, 512);
+    let hybrid_res = holder.allocate(&hybrid_cfg).expect("allocate hybrid");
+    assert_eq!(hybrid_res.block_count, 16);
+
+    let fd = holder.get_arena_fd(hybrid_res.arena_id).expect("hybrid fd");
+    let len = usize::try_from(hybrid_res.total_bytes).expect("len fits usize");
+    let mut rw = SharedMemoryArena::from_existing_fd(fd, len, "challenge_hybrid_rw", false)
+        .expect("map hybrid rw");
+
+    for step in 1_u32..=5 {
+        let byte_pat = u8::try_from(step * 17).expect("pattern fits u8");
+        {
+            let (hdr, _, inactive) =
+                recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("bank split");
+            assert_eq!(hdr.committed_step, step - 1);
+            inactive.fill(byte_pat);
+        }
+        let committed = commit_recurrent_step_in_arena(rw.as_mut_slice(), step).expect("commit");
+        assert_eq!(committed.committed_step, step);
+        assert_eq!(committed.active_bank, step % 2);
+    }
+
+    // Corrupt the inactive bank (simulating worker crash mid-layer on step 6) without committing.
+    {
+        let (hdr, active, inactive) =
+            recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("torn bank split");
+        assert_eq!(hdr.committed_step, 5);
+        assert_eq!(hdr.active_bank, 1);
+        assert!(active.iter().all(|&b| b == 85));
+        inactive[..256].fill(0xDE);
+    }
+
+    let (recovered_hdr, recovered_bank) = holder
+        .read_active_recurrent_bank(hybrid_res.arena_id)
+        .expect("untorn recovery snapshot");
+    assert_eq!(recovered_hdr.committed_step, 5);
+    assert_eq!(recovered_hdr.active_bank, 1);
+    assert!(recovered_bank.iter().all(|&b| b == 85));
+
+    // Recover and cleanly commit step 6.
+    {
+        let (_, _, inactive) =
+            recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("resume bank split");
+        inactive.fill(0x42);
+    }
+    let committed_6 = commit_recurrent_step_in_arena(rw.as_mut_slice(), 6).expect("commit step 6");
+    assert_eq!(committed_6.committed_step, 6);
+    assert_eq!(committed_6.active_bank, 0);
+    let (final_hdr, final_bank) = holder
+        .read_active_recurrent_bank(hybrid_res.arena_id)
+        .expect("final snapshot");
+    assert_eq!(final_hdr.committed_step, 6);
+    assert_eq!(final_hdr.active_bank, 0);
+    assert!(final_bank.iter().all(|&b| b == 0x42));
 }
