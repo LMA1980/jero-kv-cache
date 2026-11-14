@@ -1739,13 +1739,17 @@ fn read_block_committed_tokens_from_slice(
 ) -> Result<u32, KvError> {
     let field_off = block_committed_field_offset(block_idx, logical_block_count, meta_bytes.len())?;
     let field_slice = &meta_bytes[field_off..field_off + size_of::<u32>()];
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "4-byte AtomicU32 alignment is verified by validate_meta_slice_for_atomic"
+    )]
+    // SAFETY: `field_slice` is 4 bytes within `meta_bytes` and 4-byte aligned as verified by
+    // `validate_meta_slice_for_atomic`; a single aligned `u32` `read_volatile` avoids multi-byte
+    // torn loads while preserving `&[u8]` shared-read provenance, and the trailing `Acquire` fence
+    // orders subsequent KV slab reads after the observed watermark.
+    let val = unsafe { field_slice.as_ptr().cast::<u32>().read_volatile() };
     fence(Ordering::Acquire);
-    Ok(u32::from_ne_bytes([
-        field_slice[0],
-        field_slice[1],
-        field_slice[2],
-        field_slice[3],
-    ]))
+    Ok(val)
 }
 
 fn store_block_committed_tokens_in_slice(
