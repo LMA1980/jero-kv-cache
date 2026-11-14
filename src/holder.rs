@@ -4,19 +4,19 @@
 //! and strict operator `LimitMEMLOCK` ceiling enforcement (28 GiB reference
 //! board ceiling, ADR-037 / AGENTS.md Rule 5).
 
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use std::collections::HashMap;
 use std::fmt;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, RwLock};
 
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use jero_core::K3Error;
 use jero_core::ipc::layout::{
     ARENA_MAGIC, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS, CACHELINE_ALIGNMENT, KvBlockMeta,
-    OutputSlabHeader, SLAB_STATUS_IDLE, TAG_FREE, TokenInputSlotHeader,
+    OutputSlabHeader, RecurrentStateSlotHeader, SLAB_STATUS_IDLE, TAG_FREE, TokenInputSlotHeader,
 };
 use jero_core::ipc::protocol::{AllocateArenaRequest, StatusCode};
 use jero_core::ipc::shm::{
@@ -85,6 +85,12 @@ pub struct ArenaAllocationConfig {
     pub layer_policies: Option<Vec<LayerKvPolicy>>,
     /// Optional compressed `MLA` per-token KV latent stride (`kv_lora_rank + qk_rope_head_dim`).
     pub kv_latent_dim: Option<u32>,
+    /// Number of linear-time recurrent/SSM layers persisted via ping-pong banks.
+    pub num_recurrent_layers: u32,
+    /// Per-layer convolution history byte requirement in each recurrent bank.
+    pub conv_state_bytes_per_layer: u32,
+    /// Per-layer SSM/WKV recurrent state byte requirement in each recurrent bank.
+    pub ssm_state_bytes_per_layer: u32,
 }
 
 impl ArenaAllocationConfig {
@@ -104,6 +110,38 @@ impl ArenaAllocationConfig {
             max_blocks: None,
             layer_policies: None,
             kv_latent_dim: None,
+            num_recurrent_layers: 0,
+            conv_state_bytes_per_layer: 0,
+            ssm_state_bytes_per_layer: 0,
+        }
+    }
+
+    /// Creates a pure recurrent/SSM arena configuration (`O(1)` in `n_ctx`) with zero KV layers.
+    #[must_use]
+    pub fn new_recurrent(
+        model_id: impl Into<String>,
+        n_ctx: u32,
+        vocab_size: u32,
+        num_recurrent_layers: u32,
+        conv_state_bytes_per_layer: u32,
+        ssm_state_bytes_per_layer: u32,
+    ) -> Self {
+        Self {
+            model_id: model_id.into(),
+            n_ctx,
+            active_slots: 1,
+            head_dim: 0,
+            num_layers: 0,
+            head_count_kv: 0,
+            vocab_size,
+            lock_memory: false,
+            explicit_bytes: None,
+            max_blocks: None,
+            layer_policies: None,
+            kv_latent_dim: None,
+            num_recurrent_layers,
+            conv_state_bytes_per_layer,
+            ssm_state_bytes_per_layer,
         }
     }
 
@@ -138,6 +176,9 @@ impl ArenaAllocationConfig {
             },
             layer_policies: None,
             kv_latent_dim: None,
+            num_recurrent_layers: 0,
+            conv_state_bytes_per_layer: 0,
+            ssm_state_bytes_per_layer: 0,
         }
     }
 
@@ -196,6 +237,20 @@ impl ArenaAllocationConfig {
         self.kv_latent_dim = Some(kv_lora_rank.saturating_add(qk_rope_head_dim));
         self
     }
+
+    /// Configures ping-pong recurrent/SSM state allocation on this arena (for pure SSM or hybrid models).
+    #[must_use]
+    pub const fn with_recurrent_state(
+        mut self,
+        num_recurrent_layers: u32,
+        conv_state_bytes_per_layer: u32,
+        ssm_state_bytes_per_layer: u32,
+    ) -> Self {
+        self.num_recurrent_layers = num_recurrent_layers;
+        self.conv_state_bytes_per_layer = conv_state_bytes_per_layer;
+        self.ssm_state_bytes_per_layer = ssm_state_bytes_per_layer;
+        self
+    }
 }
 
 /// Detailed layout offsets and capacity computed for an arena.
@@ -213,6 +268,12 @@ pub struct ComputedArenaLayout {
     pub kv_blocks_offset: u64,
     /// Byte offset to the output logit slabs region.
     pub output_slabs_offset: u64,
+    /// Byte offset to the recurrent state region (after output slabs, or `0` when unused).
+    pub recurrent_state_offset: u64,
+    /// Byte stride of each ping-pong recurrent bank (`0` when unused).
+    pub recurrent_bank_stride_bytes: u64,
+    /// Total bytes reserved for the recurrent state header + two ping-pong banks (`0` when unused).
+    pub recurrent_total_bytes: u64,
 }
 
 /// Aligns a 64-bit unsigned integer up to the nearest multiple of `align`.
@@ -225,6 +286,15 @@ const fn align_up_u64(val: u64, align: u64) -> u64 {
 const fn align_up_usize(val: usize, align: usize) -> usize {
     let rem = val % align;
     if rem == 0 { val } else { val + (align - rem) }
+}
+
+/// Returns the token slot capacity bounded to [`BLOCK_SIZE_TOKENS`] for pure-recurrent (`O(1)`) arenas.
+const fn effective_token_slot_capacity(config: &ArenaAllocationConfig) -> u32 {
+    if config.num_layers == 0 && config.num_recurrent_layers > 0 {
+        BLOCK_SIZE_TOKENS
+    } else {
+        config.n_ctx
+    }
 }
 
 /// Computes the sub-region layout offsets and page-aligned total byte capacity
@@ -241,7 +311,12 @@ pub fn compute_arena_layout(
             "n_ctx must be greater than zero".to_owned(),
         ));
     }
-    if config.head_dim == 0 && config.kv_latent_dim.is_none() {
+    if config.num_layers == 0 && config.num_recurrent_layers == 0 {
+        return Err(KvError::InvalidDimensions(
+            "num_layers or num_recurrent_layers must be greater than zero".to_owned(),
+        ));
+    }
+    if config.num_layers > 0 && config.head_dim == 0 && config.kv_latent_dim.is_none() {
         return Err(KvError::InvalidDimensions(
             "head_dim must be greater than zero".to_owned(),
         ));
@@ -251,9 +326,12 @@ pub fn compute_arena_layout(
             "kv_latent_dim must be greater than zero".to_owned(),
         ));
     }
-    if config.num_layers == 0 {
+    if config.num_recurrent_layers > 0
+        && config.conv_state_bytes_per_layer == 0
+        && config.ssm_state_bytes_per_layer == 0
+    {
         return Err(KvError::InvalidDimensions(
-            "num_layers must be greater than zero".to_owned(),
+            "recurrent state bytes per layer must be greater than zero".to_owned(),
         ));
     }
 
@@ -261,8 +339,12 @@ pub fn compute_arena_layout(
     let head_count_kv = config.head_count_kv.max(1);
     let vocab_size = config.vocab_size.max(1);
 
-    // 1. Block count: 16 tokens per block
-    let mut blocks_per_slot = config.n_ctx.div_ceil(BLOCK_SIZE_TOKENS);
+    // 1. Block count: 16 tokens per block (0 for pure-recurrent O(1) arenas)
+    let mut blocks_per_slot = if config.num_layers == 0 {
+        0
+    } else {
+        config.n_ctx.div_ceil(BLOCK_SIZE_TOKENS)
+    };
     if let Some(mb) = config.max_blocks {
         blocks_per_slot = blocks_per_slot.max(mb);
     }
@@ -282,7 +364,8 @@ pub fn compute_arena_layout(
 
     // TokenInputSlot: cacheline aligned (64 bytes)
     let token_slots_offset = align_up_u64(meta_end, CACHELINE_ALIGNMENT as u64);
-    let per_slot_bytes = u64::from(config.n_ctx)
+    let slot_tokens = effective_token_slot_capacity(config);
+    let per_slot_bytes = u64::from(slot_tokens)
         .checked_mul(size_of::<u32>() as u64)
         .and_then(|t| t.checked_add(size_of::<TokenInputSlotHeader>() as u64))
         .ok_or_else(|| KvError::InvalidDimensions("token slot size overflowed u64".to_owned()))?;
@@ -298,58 +381,72 @@ pub fn compute_arena_layout(
 
     // KvBlockData: cacheline aligned (64 bytes)
     let kv_blocks_offset = align_up_u64(token_slots_end, CACHELINE_ALIGNMENT as u64);
-    let per_layer_bytes_per_token = if let Some(latent_dim) = config.kv_latent_dim {
-        u64::from(latent_dim)
-            .checked_mul(size_of::<f32>() as u64)
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("per_layer_bytes_per_token overflowed u64".to_owned())
-            })?
+    let total_kv_blocks_bytes = if config.num_layers == 0 {
+        0
     } else {
-        2u64.checked_mul(u64::from(head_count_kv))
-            .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
-            .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("per_layer_bytes_per_token overflowed u64".to_owned())
-            })?
-    };
-    let total_kv_blocks_bytes = if let Some(policies) = config.layer_policies.as_deref() {
-        let expected_layers = usize::try_from(config.num_layers).unwrap_or(0);
-        if policies.len() != expected_layers {
-            return Err(KvError::InvalidDimensions(format!(
-                "layer_policies length ({}) does not match num_layers ({expected_layers})",
-                policies.len()
-            )));
+        let per_layer_bytes_per_token = if let Some(latent_dim) = config.kv_latent_dim {
+            u64::from(latent_dim)
+                .checked_mul(size_of::<f32>() as u64)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions(
+                        "per_layer_bytes_per_token overflowed u64".to_owned(),
+                    )
+                })?
+        } else {
+            2u64.checked_mul(u64::from(head_count_kv))
+                .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
+                .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions(
+                        "per_layer_bytes_per_token overflowed u64".to_owned(),
+                    )
+                })?
+        };
+        if let Some(policies) = config.layer_policies.as_deref() {
+            let expected_layers = usize::try_from(config.num_layers).unwrap_or(0);
+            if policies.len() != expected_layers {
+                return Err(KvError::InvalidDimensions(format!(
+                    "layer_policies length ({}) does not match num_layers ({expected_layers})",
+                    policies.len()
+                )));
+            }
+            let layer_block_bytes = u64::from(BLOCK_SIZE_TOKENS)
+                .checked_mul(per_layer_bytes_per_token)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions("layer_block_bytes overflowed u64".to_owned())
+                })?;
+            let hybrid_blocks_per_slot = compute_hybrid_kv_block_count(config.n_ctx, policies);
+            let total_layer_blocks = u64::from(hybrid_blocks_per_slot)
+                .checked_mul(u64::from(active_slots))
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions(
+                        "hybrid total_layer_blocks overflowed u64".to_owned(),
+                    )
+                })?;
+            total_layer_blocks
+                .checked_mul(layer_block_bytes)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions(
+                        "hybrid total_kv_blocks_bytes overflowed u64".to_owned(),
+                    )
+                })?
+        } else {
+            let bytes_per_token = u64::from(config.num_layers)
+                .checked_mul(per_layer_bytes_per_token)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions("bytes_per_token overflowed u64".to_owned())
+                })?;
+            let block_bytes = u64::from(BLOCK_SIZE_TOKENS)
+                .checked_mul(bytes_per_token)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions("block_bytes overflowed u64".to_owned())
+                })?;
+            u64::from(block_count)
+                .checked_mul(block_bytes)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions("total_kv_blocks_bytes overflowed u64".to_owned())
+                })?
         }
-        let layer_block_bytes = u64::from(BLOCK_SIZE_TOKENS)
-            .checked_mul(per_layer_bytes_per_token)
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("layer_block_bytes overflowed u64".to_owned())
-            })?;
-        let hybrid_blocks_per_slot = compute_hybrid_kv_block_count(config.n_ctx, policies);
-        let total_layer_blocks = u64::from(hybrid_blocks_per_slot)
-            .checked_mul(u64::from(active_slots))
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("hybrid total_layer_blocks overflowed u64".to_owned())
-            })?;
-        total_layer_blocks
-            .checked_mul(layer_block_bytes)
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("hybrid total_kv_blocks_bytes overflowed u64".to_owned())
-            })?
-    } else {
-        let bytes_per_token = u64::from(config.num_layers)
-            .checked_mul(per_layer_bytes_per_token)
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("bytes_per_token overflowed u64".to_owned())
-            })?;
-        let block_bytes = u64::from(BLOCK_SIZE_TOKENS)
-            .checked_mul(bytes_per_token)
-            .ok_or_else(|| KvError::InvalidDimensions("block_bytes overflowed u64".to_owned()))?;
-        u64::from(block_count)
-            .checked_mul(block_bytes)
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("total_kv_blocks_bytes overflowed u64".to_owned())
-            })?
     };
     let kv_blocks_end = kv_blocks_offset
         .checked_add(total_kv_blocks_bytes)
@@ -369,7 +466,43 @@ pub fn compute_arena_layout(
         .checked_add(total_slabs_bytes)
         .ok_or_else(|| KvError::InvalidDimensions("output_slabs_end overflowed u64".to_owned()))?;
 
-    let min_required_bytes = output_slabs_end;
+    // RecurrentStateSlotHeader + dual ping-pong banks immediately after output slabs (Option A)
+    let (recurrent_state_offset, recurrent_bank_stride_bytes, recurrent_total_bytes) =
+        if config.num_recurrent_layers > 0 {
+            let align = CACHELINE_ALIGNMENT as u64;
+            let conv_aligned = align_up_u64(u64::from(config.conv_state_bytes_per_layer), align);
+            let ssm_aligned = align_up_u64(u64::from(config.ssm_state_bytes_per_layer), align);
+            let per_layer_stride = conv_aligned.checked_add(ssm_aligned).ok_or_else(|| {
+                KvError::InvalidDimensions("recurrent per-layer stride overflowed u64".to_owned())
+            })?;
+            let bank_stride = u64::from(config.num_recurrent_layers)
+                .checked_mul(per_layer_stride)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions("recurrent bank_stride overflowed u64".to_owned())
+                })?;
+            let offset = align_up_u64(output_slabs_end, align);
+            let two_banks = 2_u64.checked_mul(bank_stride).ok_or_else(|| {
+                KvError::InvalidDimensions("recurrent dual-bank size overflowed u64".to_owned())
+            })?;
+            let total_region = (size_of::<RecurrentStateSlotHeader>() as u64)
+                .checked_add(two_banks)
+                .ok_or_else(|| {
+                    KvError::InvalidDimensions("recurrent_total_bytes overflowed u64".to_owned())
+                })?;
+            (offset, bank_stride, total_region)
+        } else {
+            (0, 0, 0)
+        };
+
+    let min_required_bytes = if config.num_recurrent_layers > 0 {
+        recurrent_state_offset
+            .checked_add(recurrent_total_bytes)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("arena min_required_bytes overflowed u64".to_owned())
+            })?
+    } else {
+        output_slabs_end
+    };
     let raw_bytes = if let Some(explicit) = config.explicit_bytes {
         explicit.max(min_required_bytes)
     } else {
@@ -386,6 +519,9 @@ pub fn compute_arena_layout(
         token_slots_offset,
         kv_blocks_offset,
         output_slabs_offset,
+        recurrent_state_offset,
+        recurrent_bank_stride_bytes,
+        recurrent_total_bytes,
     })
 }
 
@@ -755,6 +891,236 @@ impl KvHolder {
             0
         }
     }
+
+    /// Reads and validates the [`RecurrentStateSlotHeader`] for an active arena.
+    ///
+    /// # Errors
+    /// Returns [`KvError::ArenaNotFound`] if `arena_id` is not registered, or
+    /// [`KvError::InvalidDimensions`] / [`KvError::IpcError`] if the arena has no valid
+    /// recurrent state region.
+    pub fn read_recurrent_slot_header(
+        &self,
+        arena_id: u64,
+    ) -> Result<RecurrentStateSlotHeader, KvError> {
+        let arena = self
+            .get_arena(arena_id)
+            .ok_or(KvError::ArenaNotFound(arena_id))?;
+        let arena_bytes = arena.as_slice();
+        let hdr_bytes = arena_bytes
+            .get(..size_of::<ArenaHeader>())
+            .ok_or_else(|| KvError::IpcError("arena too small for ArenaHeader".to_owned()))?;
+        let arena_hdr = ArenaHeader::read_from_bytes(hdr_bytes)
+            .map_err(|e| KvError::IpcError(format!("invalid ArenaHeader: {e}")))?;
+        let rec_off = usize::try_from(recurrent_region_offset(&arena_hdr)).map_err(|_| {
+            KvError::InvalidDimensions("recurrent_state_offset exceeds address space".to_owned())
+        })?;
+        let region = arena_bytes.get(rec_off..).ok_or_else(|| {
+            KvError::IpcError("arena truncated before recurrent region".to_owned())
+        })?;
+        read_recurrent_slot_header_from_region(region)
+    }
+
+    /// Reads the durably committed `active_bank` payload snapshot and header for crash recovery.
+    ///
+    /// # Errors
+    /// Returns [`KvError::ArenaNotFound`] if `arena_id` is not registered, or
+    /// [`KvError::InvalidDimensions`] / [`KvError::IpcError`] if the recurrent state region is invalid.
+    pub fn read_active_recurrent_bank(
+        &self,
+        arena_id: u64,
+    ) -> Result<(RecurrentStateSlotHeader, Vec<u8>), KvError> {
+        let arena = self
+            .get_arena(arena_id)
+            .ok_or(KvError::ArenaNotFound(arena_id))?;
+        let arena_bytes = arena.as_slice();
+        let hdr_bytes = arena_bytes
+            .get(..size_of::<ArenaHeader>())
+            .ok_or_else(|| KvError::IpcError("arena too small for ArenaHeader".to_owned()))?;
+        let arena_hdr = ArenaHeader::read_from_bytes(hdr_bytes)
+            .map_err(|e| KvError::IpcError(format!("invalid ArenaHeader: {e}")))?;
+        let rec_off = usize::try_from(recurrent_region_offset(&arena_hdr)).map_err(|_| {
+            KvError::InvalidDimensions("recurrent_state_offset exceeds address space".to_owned())
+        })?;
+        let region = arena_bytes.get(rec_off..).ok_or_else(|| {
+            KvError::IpcError("arena truncated before recurrent region".to_owned())
+        })?;
+        let rec_hdr = read_recurrent_slot_header_from_region(region)?;
+        let total = usize::try_from(rec_hdr.total_region_bytes()).map_err(|_| {
+            KvError::InvalidDimensions("recurrent region size exceeds address space".to_owned())
+        })?;
+        if region.len() < total {
+            return Err(KvError::IpcError(
+                "arena truncated inside recurrent ping-pong banks".to_owned(),
+            ));
+        }
+        let bank_off =
+            usize::try_from(rec_hdr.bank_offset_bytes(rec_hdr.active_bank)).map_err(|_| {
+                KvError::InvalidDimensions("active bank offset exceeds address space".to_owned())
+            })?;
+        let bank_len = usize::try_from(rec_hdr.bank_stride_bytes).map_err(|_| {
+            KvError::InvalidDimensions("bank stride exceeds address space".to_owned())
+        })?;
+        let bank_slice = &region[bank_off..bank_off + bank_len];
+        Ok((rec_hdr, bank_slice.to_vec()))
+    }
+}
+
+/// Computes the cacheline-aligned start offset of the ping-pong recurrent state region
+/// deterministically immediately after the output logit slabs, without modifying [`ArenaHeader`].
+#[must_use]
+pub fn recurrent_region_offset(header: &ArenaHeader) -> u64 {
+    let vocab_size = u64::from(header.vocab_size.max(1));
+    let active_slots = u64::from(header.active_slots.max(1));
+    let per_slab_bytes = vocab_size
+        .saturating_mul(size_of::<f32>() as u64)
+        .saturating_add(size_of::<OutputSlabHeader>() as u64);
+    let aligned_slab_bytes = align_up_u64(per_slab_bytes, CACHELINE_ALIGNMENT as u64);
+    let total_slabs_bytes = aligned_slab_bytes.saturating_mul(active_slots);
+    let output_slabs_end = header.output_slabs_offset.saturating_add(total_slabs_bytes);
+    align_up_u64(output_slabs_end, CACHELINE_ALIGNMENT as u64)
+}
+
+/// Reads and validates a [`RecurrentStateSlotHeader`] from the beginning of a recurrent region slice.
+///
+/// # Errors
+/// Returns [`KvError::IpcError`] if `region` is shorter than 64 bytes or malformed, or
+/// [`KvError::InvalidDimensions`] if header validation fails or `num_recurrent_layers == 0`.
+pub fn read_recurrent_slot_header_from_region(
+    region: &[u8],
+) -> Result<RecurrentStateSlotHeader, KvError> {
+    let hdr_bytes = region
+        .get(..size_of::<RecurrentStateSlotHeader>())
+        .ok_or_else(|| {
+            KvError::IpcError("recurrent region shorter than 64-byte header".to_owned())
+        })?;
+    fence(Ordering::Acquire);
+    let hdr = RecurrentStateSlotHeader::read_from_bytes(hdr_bytes)
+        .map_err(|e| KvError::IpcError(format!("invalid RecurrentStateSlotHeader: {e}")))?;
+    hdr.validate()
+        .map_err(|msg| KvError::InvalidDimensions(msg.to_owned()))?;
+    if hdr.num_recurrent_layers == 0 {
+        return Err(KvError::InvalidDimensions(
+            "recurrent state header reports zero recurrent layers".to_owned(),
+        ));
+    }
+    Ok(hdr)
+}
+
+/// Returns `(header, active_bank_readonly, inactive_bank_mutable)` for zero-tearing ping-pong execution.
+///
+/// Workers read checkpointed previous state from the active bank slice and write next-step state
+/// exclusively into the inactive staging bank slice prior to calling [`commit_recurrent_step_in_region`].
+///
+/// # Errors
+/// Returns [`KvError::IpcError`] or [`KvError::InvalidDimensions`] if the region is truncated or invalid.
+pub fn recurrent_banks_from_region_mut(
+    region: &mut [u8],
+) -> Result<(RecurrentStateSlotHeader, &[u8], &mut [u8]), KvError> {
+    let hdr = read_recurrent_slot_header_from_region(region)?;
+    let hdr_len = size_of::<RecurrentStateSlotHeader>();
+    let total = usize::try_from(hdr.total_region_bytes()).map_err(|_| {
+        KvError::InvalidDimensions("recurrent region size exceeds address space".to_owned())
+    })?;
+    let stride = usize::try_from(hdr.bank_stride_bytes).map_err(|_| {
+        KvError::InvalidDimensions("recurrent bank_stride exceeds address space".to_owned())
+    })?;
+    if region.len() < total {
+        return Err(KvError::IpcError(format!(
+            "recurrent region len ({}) < required ({total})",
+            region.len()
+        )));
+    }
+    let dual_payload = &mut region[hdr_len..total];
+    let (first_bank, second_bank) = dual_payload.split_at_mut(stride);
+    if hdr.active_bank == 0 {
+        Ok((hdr, &*first_bank, second_bank))
+    } else {
+        Ok((hdr, &*second_bank, first_bank))
+    }
+}
+
+/// Atomically flips `active_bank` (`0 <-> 1`) and updates `committed_step` in a recurrent region header.
+///
+/// Emits a `Release` barrier after staging-bank writes and stores `(new_step, inactive_bank)` in a
+/// single aligned 64-bit atomic store (`AtomicU64`) at byte offset `0` of `region`, guaranteeing that
+/// either both fields advance together or neither changes on crash.
+///
+/// # Errors
+/// Returns [`KvError::IpcError`] if `region` is unaligned (`% 8 != 0`) or truncated, or
+/// [`KvError::InvalidDimensions`] if header invariants fail.
+pub fn commit_recurrent_step_in_region(
+    region: &mut [u8],
+    new_step: u32,
+) -> Result<RecurrentStateSlotHeader, KvError> {
+    let mut hdr = read_recurrent_slot_header_from_region(region)?;
+    if (region.as_ptr() as usize) % align_of::<AtomicU64>() != 0 {
+        return Err(KvError::IpcError(
+            "recurrent region base pointer is not 8-byte aligned for atomic commit".to_owned(),
+        ));
+    }
+    let next_bank = hdr.inactive_bank();
+    hdr.committed_step = new_step;
+    hdr.active_bank = next_bank;
+
+    let mut word = [0_u8; 8];
+    word[0..4].copy_from_slice(&new_step.to_ne_bytes());
+    word[4..8].copy_from_slice(&next_bank.to_ne_bytes());
+    let packed = u64::from_ne_bytes(word);
+
+    fence(Ordering::Release);
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "8-byte AtomicU64 alignment is runtime-checked directly above"
+    )]
+    // SAFETY: `region` has len >= 64 and its base pointer was verified 8-byte aligned (`AtomicU64`).
+    unsafe {
+        AtomicU64::from_ptr(region.as_mut_ptr().cast::<u64>()).store(packed, Ordering::Release);
+    }
+
+    Ok(hdr)
+}
+
+/// Locates the recurrent region inside `arena_bytes` via [`ArenaHeader`] and returns split ping-pong views.
+///
+/// # Errors
+/// Returns [`KvError`] if [`ArenaHeader`] or the trailing recurrent region is invalid or truncated.
+pub fn recurrent_banks_in_arena_mut(
+    arena_bytes: &mut [u8],
+) -> Result<(RecurrentStateSlotHeader, &[u8], &mut [u8]), KvError> {
+    let hdr_bytes = arena_bytes
+        .get(..size_of::<ArenaHeader>())
+        .ok_or_else(|| KvError::IpcError("arena too small for ArenaHeader".to_owned()))?;
+    let arena_hdr = ArenaHeader::read_from_bytes(hdr_bytes)
+        .map_err(|e| KvError::IpcError(format!("invalid ArenaHeader: {e}")))?;
+    let rec_off = usize::try_from(recurrent_region_offset(&arena_hdr)).map_err(|_| {
+        KvError::InvalidDimensions("recurrent_state_offset exceeds address space".to_owned())
+    })?;
+    let region = arena_bytes
+        .get_mut(rec_off..)
+        .ok_or_else(|| KvError::IpcError("arena truncated before recurrent region".to_owned()))?;
+    recurrent_banks_from_region_mut(region)
+}
+
+/// Locates the recurrent region inside `arena_bytes` via [`ArenaHeader`] and commits `new_step`.
+///
+/// # Errors
+/// Returns [`KvError`] if [`ArenaHeader`] or the trailing recurrent region is invalid or truncated.
+pub fn commit_recurrent_step_in_arena(
+    arena_bytes: &mut [u8],
+    new_step: u32,
+) -> Result<RecurrentStateSlotHeader, KvError> {
+    let hdr_bytes = arena_bytes
+        .get(..size_of::<ArenaHeader>())
+        .ok_or_else(|| KvError::IpcError("arena too small for ArenaHeader".to_owned()))?;
+    let arena_hdr = ArenaHeader::read_from_bytes(hdr_bytes)
+        .map_err(|e| KvError::IpcError(format!("invalid ArenaHeader: {e}")))?;
+    let rec_off = usize::try_from(recurrent_region_offset(&arena_hdr)).map_err(|_| {
+        KvError::InvalidDimensions("recurrent_state_offset exceeds address space".to_owned())
+    })?;
+    let region = arena_bytes
+        .get_mut(rec_off..)
+        .ok_or_else(|| KvError::IpcError("arena truncated before recurrent region".to_owned()))?;
+    commit_recurrent_step_in_region(region, new_step)
 }
 
 /// Initializes the `ArenaHeader`, `KvBlockMeta` entries, and slot/slab headers
@@ -820,8 +1186,8 @@ fn initialize_arena_contents(
 
     // 3. Initialize TokenInputSlotHeader for active_slots
     let active_slots = config.active_slots.max(1) as usize;
-    let raw_slot_bytes =
-        config.n_ctx as usize * size_of::<u32>() + size_of::<TokenInputSlotHeader>();
+    let raw_slot_bytes = effective_token_slot_capacity(config) as usize * size_of::<u32>()
+        + size_of::<TokenInputSlotHeader>();
     let per_slot_bytes = align_up_usize(raw_slot_bytes, CACHELINE_ALIGNMENT);
     let token_slots_base = usize::try_from(layout.token_slots_offset).map_err(|_| {
         KvError::InvalidDimensions("token_slots_offset exceeds address space".to_owned())
@@ -875,6 +1241,46 @@ fn initialize_arena_contents(
             status: SLAB_STATUS_IDLE,
             _reserved: [0; 44],
         };
+    }
+
+    // 5. Initialize RecurrentStateSlotHeader and zero dual ping-pong banks when configured
+    if config.num_recurrent_layers > 0 {
+        let align = CACHELINE_ALIGNMENT as u64;
+        let conv_aligned = u32::try_from(align_up_u64(
+            u64::from(config.conv_state_bytes_per_layer),
+            align,
+        ))
+        .map_err(|_| {
+            KvError::InvalidDimensions("conv_state_bytes_per_layer exceeds u32".to_owned())
+        })?;
+        let ssm_aligned = u32::try_from(align_up_u64(
+            u64::from(config.ssm_state_bytes_per_layer),
+            align,
+        ))
+        .map_err(|_| {
+            KvError::InvalidDimensions("ssm_state_bytes_per_layer exceeds u32".to_owned())
+        })?;
+        let rec_off = usize::try_from(layout.recurrent_state_offset).map_err(|_| {
+            KvError::InvalidDimensions("recurrent_state_offset exceeds address space".to_owned())
+        })?;
+        let rec_total = usize::try_from(layout.recurrent_total_bytes).map_err(|_| {
+            KvError::InvalidDimensions("recurrent_total_bytes exceeds address space".to_owned())
+        })?;
+        let rec_slice = arena.slice_mut(rec_off, rec_total).map_err(|e| {
+            KvError::IpcError(format!("failed to slice recurrent state region: {e}"))
+        })?;
+        rec_slice.fill(0);
+        let rec_hdr = RecurrentStateSlotHeader::new(
+            config.num_recurrent_layers,
+            conv_aligned,
+            ssm_aligned,
+            layout.recurrent_bank_stride_bytes,
+        );
+        rec_hdr
+            .validate()
+            .map_err(|msg| KvError::InvalidDimensions(msg.to_owned()))?;
+        let hdr_size = size_of::<RecurrentStateSlotHeader>();
+        rec_slice[..hdr_size].copy_from_slice(rec_hdr.as_bytes());
     }
 
     Ok(())
@@ -1183,5 +1589,199 @@ mod tests {
             mla_layout.total_bytes,
             full_layout.total_bytes
         );
+    }
+
+    #[test]
+    fn test_o1_recurrent_state_arena_sizing() {
+        let small_ctx_cfg =
+            ArenaAllocationConfig::new_recurrent("mamba2", 512, 32_000, 64, 1024, 4096);
+        let large_ctx_cfg =
+            ArenaAllocationConfig::new_recurrent("mamba2", 32_768, 32_000, 64, 1024, 4096);
+
+        let small_layout = compute_arena_layout(&small_ctx_cfg).expect("512-ctx recurrent layout");
+        let large_layout = compute_arena_layout(&large_ctx_cfg).expect("32k-ctx recurrent layout");
+
+        assert_eq!(small_layout.block_count, 0);
+        assert_eq!(large_layout.block_count, 0);
+        assert_eq!(
+            small_layout.total_bytes, large_layout.total_bytes,
+            "pure recurrent arena sizing must remain O(1) as n_ctx grows from 512 to 32768"
+        );
+        assert_eq!(small_layout.recurrent_bank_stride_bytes, 64 * (1024 + 4096));
+        assert_eq!(small_layout.recurrent_total_bytes, 64 + 2 * 64 * 5120);
+
+        let hybrid_cfg = ArenaAllocationConfig::new("jamba", 1024, 128, 4)
+            .with_head_count_kv(4)
+            .with_vocab_size(32_000)
+            .with_recurrent_state(28, 512, 2048);
+        let hybrid_layout = compute_arena_layout(&hybrid_cfg).expect("hybrid jamba layout");
+        assert_eq!(hybrid_layout.block_count, 64);
+        assert!(hybrid_layout.recurrent_state_offset >= hybrid_layout.output_slabs_offset);
+        assert_eq!(hybrid_layout.recurrent_bank_stride_bytes, 28 * (512 + 2048));
+        assert_eq!(hybrid_layout.recurrent_total_bytes, 64 + 2 * 28 * 2560);
+    }
+
+    #[test]
+    fn test_ping_pong_bank_flip_and_rollback() {
+        #[repr(C, align(64))]
+        struct AlignedRegion([u8; 4096]);
+
+        let mut region = AlignedRegion([0_u8; 4096]);
+        let init = RecurrentStateSlotHeader::new(2, 64, 128, 384);
+        assert_eq!(init.bank_stride_bytes, 384);
+        assert_eq!(init.total_region_bytes(), 832);
+        region.0[..size_of::<RecurrentStateSlotHeader>()].copy_from_slice(init.as_bytes());
+
+        {
+            let (hdr, active, inactive) =
+                recurrent_banks_from_region_mut(&mut region.0).expect("initial bank split");
+            assert_eq!(hdr.committed_step, 0);
+            assert_eq!(hdr.active_bank, 0);
+            assert!(active.iter().all(|&b| b == 0));
+            inactive.fill(0xA1);
+        }
+
+        let step_one_hdr =
+            commit_recurrent_step_in_region(&mut region.0, 1).expect("commit step 1");
+        assert_eq!(step_one_hdr.committed_step, 1);
+        assert_eq!(step_one_hdr.active_bank, 1);
+
+        // Simulate a worker crash partway through writing the staging bank before atomic commit.
+        {
+            let (hdr, active, inactive) =
+                recurrent_banks_from_region_mut(&mut region.0).expect("step 1 bank split");
+            assert_eq!(hdr.committed_step, 1);
+            assert_eq!(hdr.active_bank, 1);
+            assert!(active.iter().all(|&b| b == 0xA1));
+            inactive[..128].fill(0xEE);
+        }
+
+        // Rollback verification: committed_step, active_bank, and bank 1 contents remain intact.
+        let reread = read_recurrent_slot_header_from_region(&region.0).expect("reread header");
+        assert_eq!(reread.committed_step, 1);
+        assert_eq!(reread.active_bank, 1);
+        {
+            let (_, active, inactive) =
+                recurrent_banks_from_region_mut(&mut region.0).expect("post-crash bank split");
+            assert!(
+                active.iter().all(|&b| b == 0xA1),
+                "active committed bank must never tear on incomplete staging write"
+            );
+            inactive.fill(0xB2);
+        }
+
+        let step_two_hdr =
+            commit_recurrent_step_in_region(&mut region.0, 2).expect("commit step 2");
+        assert_eq!(step_two_hdr.committed_step, 2);
+        assert_eq!(step_two_hdr.active_bank, 0);
+        let (hdr_after, active_after, _) =
+            recurrent_banks_from_region_mut(&mut region.0).expect("step 2 bank split");
+        assert_eq!(hdr_after.committed_step, 2);
+        assert_eq!(hdr_after.active_bank, 0);
+        assert!(active_after.iter().all(|&b| b == 0xB2));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_ping_pong_recurrent_checkpoint() {
+        let holder = KvHolder::new();
+        let cfg = ArenaAllocationConfig::new_recurrent("rwkv7", 256, 1024, 4, 128, 256);
+        let res = holder
+            .allocate(&cfg)
+            .expect("pure recurrent allocation should succeed");
+        assert_eq!(res.block_count, 0);
+
+        let initial_hdr = holder
+            .read_recurrent_slot_header(res.arena_id)
+            .expect("recurrent header should be initialized");
+        assert_eq!(initial_hdr.committed_step, 0);
+        assert_eq!(initial_hdr.active_bank, 0);
+        assert_eq!(initial_hdr.num_recurrent_layers, 4);
+        assert_eq!(initial_hdr.conv_state_bytes_per_layer, 128);
+        assert_eq!(initial_hdr.ssm_state_bytes_per_layer, 256);
+
+        let fd = holder.get_arena_fd(res.arena_id).expect("arena fd");
+        let len = usize::try_from(res.total_bytes).expect("arena len fits usize");
+        let mut rw = SharedMemoryArena::from_existing_fd(fd, len, "test_rec_rw", false)
+            .expect("rw mapping from existing fd");
+
+        {
+            let (hdr, active, inactive) =
+                recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("arena bank split");
+            assert_eq!(hdr.active_bank, 0);
+            assert!(active.iter().all(|&b| b == 0));
+            inactive.fill(0x3C);
+        }
+
+        let committed =
+            commit_recurrent_step_in_arena(rw.as_mut_slice(), 7).expect("commit step 7");
+        assert_eq!(committed.committed_step, 7);
+        assert_eq!(committed.active_bank, 1);
+
+        let (snap_hdr, snap_bank) = holder
+            .read_active_recurrent_bank(res.arena_id)
+            .expect("read committed active bank");
+        assert_eq!(snap_hdr.committed_step, 7);
+        assert_eq!(snap_hdr.active_bank, 1);
+        assert_eq!(
+            snap_bank.len(),
+            usize::try_from(snap_hdr.bank_stride_bytes).unwrap()
+        );
+        assert!(snap_bank.iter().all(|&b| b == 0x3C));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_atomic_ping_pong_recurrent_recovery() {
+        let holder = KvHolder::new();
+        let cfg = ArenaAllocationConfig::new_recurrent("mamba2", 512, 2048, 2, 64, 192);
+        let res = holder
+            .allocate(&cfg)
+            .expect("recurrent arena allocation should succeed");
+        let fd = holder.get_arena_fd(res.arena_id).expect("arena fd");
+        let len = usize::try_from(res.total_bytes).expect("arena len fits usize");
+        let mut rw = SharedMemoryArena::from_existing_fd(fd, len, "test_rec_recovery", false)
+            .expect("rw mapping");
+
+        {
+            let (_, _, inactive) =
+                recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("bank split step 1");
+            inactive.fill(0x11);
+        }
+        let first_commit =
+            commit_recurrent_step_in_arena(rw.as_mut_slice(), 1).expect("commit step 1");
+        assert_eq!(first_commit.committed_step, 1);
+        assert_eq!(first_commit.active_bank, 1);
+
+        // Write a partial torn state to inactive bank 0 and simulate crash before commit.
+        {
+            let (_, _, inactive) =
+                recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("bank split torn");
+            inactive[..64].fill(0xFF);
+        }
+
+        let (recovered_hdr, recovered_bank) = holder
+            .read_active_recurrent_bank(res.arena_id)
+            .expect("recovery snapshot");
+        assert_eq!(recovered_hdr.committed_step, 1);
+        assert_eq!(recovered_hdr.active_bank, 1);
+        assert!(recovered_bank.iter().all(|&b| b == 0x11));
+
+        // Resume cleanly and commit step 2.
+        {
+            let (_, _, inactive) =
+                recurrent_banks_in_arena_mut(rw.as_mut_slice()).expect("bank split step 2");
+            inactive.fill(0x22);
+        }
+        let second_commit =
+            commit_recurrent_step_in_arena(rw.as_mut_slice(), 2).expect("commit step 2");
+        assert_eq!(second_commit.committed_step, 2);
+        assert_eq!(second_commit.active_bank, 0);
+        let (final_hdr, final_bank) = holder
+            .read_active_recurrent_bank(res.arena_id)
+            .expect("final snapshot");
+        assert_eq!(final_hdr.committed_step, 2);
+        assert_eq!(final_hdr.active_bank, 0);
+        assert!(final_bank.iter().all(|&b| b == 0x22));
     }
 }
