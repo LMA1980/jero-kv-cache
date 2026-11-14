@@ -408,6 +408,11 @@ fn test_adversarial_heavy_concurrent_clients_stress() {
                     arena_bytes: 128 * 1024, // 128 KiB
                     n_ctx: 64,
                     max_blocks: 4,
+                    num_layers: 2,
+                    head_count_kv: 2,
+                    head_dim: 64,
+                    vocab_size: 32_000,
+                    kv_dtype: 0,
                 });
                 send_msg_frame(&stream, &alloc_req, None).unwrap();
                 let (alloc_resp, _) = recv_msg_frame(&stream).unwrap();

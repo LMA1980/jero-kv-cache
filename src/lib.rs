@@ -13,9 +13,10 @@ pub mod holder;
 pub mod server;
 
 pub use holder::{
-    ArenaAllocationConfig, ArenaAllocationResult, ComputedArenaLayout, KvError, KvHolder,
-    LayerKvPolicy, commit_recurrent_step_in_arena, commit_recurrent_step_in_region,
-    compute_arena_layout, compute_hybrid_kv_block_count, read_recurrent_slot_header_from_region,
+    ArenaAllocationConfig, ArenaAllocationResult, ArenaHandle, ComputedArenaLayout, KvError,
+    KvHolder, LayerKvPolicy, arena_kv_dtype, arena_seq_capacity, commit_recurrent_step_in_arena,
+    commit_recurrent_step_in_region, compute_arena_layout, compute_hybrid_kv_block_count,
+    kv_cache_view_from_arena_slice_mut, read_recurrent_slot_header_from_region,
     recurrent_banks_from_region_mut, recurrent_banks_in_arena_mut, recurrent_region_offset,
 };
 pub use server::{
