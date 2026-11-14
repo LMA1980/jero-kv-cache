@@ -83,6 +83,8 @@ pub struct ArenaAllocationConfig {
     pub max_blocks: Option<u32>,
     /// Optional per-layer hybrid local/global KV retention schedule.
     pub layer_policies: Option<Vec<LayerKvPolicy>>,
+    /// Optional compressed `MLA` per-token KV latent stride (`kv_lora_rank + qk_rope_head_dim`).
+    pub kv_latent_dim: Option<u32>,
 }
 
 impl ArenaAllocationConfig {
@@ -101,6 +103,7 @@ impl ArenaAllocationConfig {
             explicit_bytes: None,
             max_blocks: None,
             layer_policies: None,
+            kv_latent_dim: None,
         }
     }
 
@@ -134,6 +137,7 @@ impl ArenaAllocationConfig {
                 None
             },
             layer_policies: None,
+            kv_latent_dim: None,
         }
     }
 
@@ -185,6 +189,13 @@ impl ArenaAllocationConfig {
         self.layer_policies = Some(policies);
         self
     }
+
+    /// Configures compressed Multi-Head Latent Attention (`MLA`) per-token KV latent width (`kv_lora_rank + qk_rope_head_dim`).
+    #[must_use]
+    pub const fn with_kv_latent_dim(mut self, kv_lora_rank: u32, qk_rope_head_dim: u32) -> Self {
+        self.kv_latent_dim = Some(kv_lora_rank.saturating_add(qk_rope_head_dim));
+        self
+    }
 }
 
 /// Detailed layout offsets and capacity computed for an arena.
@@ -230,9 +241,14 @@ pub fn compute_arena_layout(
             "n_ctx must be greater than zero".to_owned(),
         ));
     }
-    if config.head_dim == 0 {
+    if config.head_dim == 0 && config.kv_latent_dim.is_none() {
         return Err(KvError::InvalidDimensions(
             "head_dim must be greater than zero".to_owned(),
+        ));
+    }
+    if config.kv_latent_dim == Some(0) {
+        return Err(KvError::InvalidDimensions(
+            "kv_latent_dim must be greater than zero".to_owned(),
         ));
     }
     if config.num_layers == 0 {
@@ -282,6 +298,20 @@ pub fn compute_arena_layout(
 
     // KvBlockData: cacheline aligned (64 bytes)
     let kv_blocks_offset = align_up_u64(token_slots_end, CACHELINE_ALIGNMENT as u64);
+    let per_layer_bytes_per_token = if let Some(latent_dim) = config.kv_latent_dim {
+        u64::from(latent_dim)
+            .checked_mul(size_of::<f32>() as u64)
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("per_layer_bytes_per_token overflowed u64".to_owned())
+            })?
+    } else {
+        2u64.checked_mul(u64::from(head_count_kv))
+            .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
+            .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
+            .ok_or_else(|| {
+                KvError::InvalidDimensions("per_layer_bytes_per_token overflowed u64".to_owned())
+            })?
+    };
     let total_kv_blocks_bytes = if let Some(policies) = config.layer_policies.as_deref() {
         let expected_layers = usize::try_from(config.num_layers).unwrap_or(0);
         if policies.len() != expected_layers {
@@ -290,13 +320,6 @@ pub fn compute_arena_layout(
                 policies.len()
             )));
         }
-        let per_layer_bytes_per_token = 2u64
-            .checked_mul(u64::from(head_count_kv))
-            .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
-            .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
-            .ok_or_else(|| {
-                KvError::InvalidDimensions("per_layer_bytes_per_token overflowed u64".to_owned())
-            })?;
         let layer_block_bytes = u64::from(BLOCK_SIZE_TOKENS)
             .checked_mul(per_layer_bytes_per_token)
             .ok_or_else(|| {
@@ -314,12 +337,8 @@ pub fn compute_arena_layout(
                 KvError::InvalidDimensions("hybrid total_kv_blocks_bytes overflowed u64".to_owned())
             })?
     } else {
-        // 2 vectors (Key & Value) per token * num_layers * head_count_kv * head_dim * sizeof(f32)
-        let bytes_per_token = 2u64
-            .checked_mul(u64::from(config.num_layers))
-            .and_then(|v| v.checked_mul(u64::from(head_count_kv)))
-            .and_then(|v| v.checked_mul(u64::from(config.head_dim)))
-            .and_then(|v| v.checked_mul(size_of::<f32>() as u64))
+        let bytes_per_token = u64::from(config.num_layers)
+            .checked_mul(per_layer_bytes_per_token)
             .ok_or_else(|| {
                 KvError::InvalidDimensions("bytes_per_token overflowed u64".to_owned())
             })?;
@@ -1118,6 +1137,50 @@ mod tests {
             hybrid_layout.total_bytes * 4 < full_layout.total_bytes,
             "hybrid 5:1 arena ({}) should be >4x smaller than homogeneous full-context ({})",
             hybrid_layout.total_bytes,
+            full_layout.total_bytes
+        );
+    }
+
+    #[test]
+    fn test_holder_mla_latent_stride() {
+        let cfg = ArenaAllocationConfig::new("deepseek2", 64, 192, 27)
+            .with_head_count_kv(16)
+            .with_kv_latent_dim(512, 64);
+        assert_eq!(cfg.kv_latent_dim, Some(576));
+        let layout = compute_arena_layout(&cfg).expect("mla layout");
+        let zero_cfg = ArenaAllocationConfig::new("deepseek2", 64, 0, 1).with_kv_latent_dim(0, 0);
+        assert!(matches!(
+            compute_arena_layout(&zero_cfg),
+            Err(KvError::InvalidDimensions(_))
+        ));
+        assert!(layout.total_bytes > 0);
+    }
+
+    #[test]
+    fn test_mla_compressed_block_bytes() {
+        // Single layer, single 16-token block: 16 * (512 + 64) * 4 = 36_864 bytes of KV block payload
+        let cfg = ArenaAllocationConfig::new("deepseek2", 16, 0, 1)
+            .with_vocab_size(0)
+            .with_kv_latent_dim(512, 64);
+        let layout = compute_arena_layout(&cfg).expect("single-block mla layout");
+        let kv_span = layout.output_slabs_offset - layout.kv_blocks_offset;
+        assert_eq!(kv_span, 36_864);
+    }
+
+    #[test]
+    fn test_deepseek2_mla_latent_kv_layout() {
+        // DeepSeek-V2-Lite: 27 layers, n_ctx = 4096, uncompressed 16*192 vs latent 512+64=576
+        let uncompressed_cfg =
+            ArenaAllocationConfig::new("deepseek2", 4096, 192, 27).with_head_count_kv(16);
+        let mla_cfg = ArenaAllocationConfig::new("deepseek2", 4096, 192, 27)
+            .with_head_count_kv(16)
+            .with_kv_latent_dim(512, 64);
+        let full_layout = compute_arena_layout(&uncompressed_cfg).expect("full layout");
+        let mla_layout = compute_arena_layout(&mla_cfg).expect("mla layout");
+        assert!(
+            mla_layout.total_bytes * 5 < full_layout.total_bytes,
+            "MLA latent arena ({}) should be >80% smaller than uncompressed GQA ({})",
+            mla_layout.total_bytes,
             full_layout.total_bytes
         );
     }
