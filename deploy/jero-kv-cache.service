@@ -1,0 +1,37 @@
+[Unit]
+Description=Jero KV Cache Shared-Memory Context Holder Daemon
+Documentation=https://github.com/LMA1980/jero-kv-cache
+Before=jero-manager.service jero-engine.service
+
+[Service]
+Type=simple
+Slice=jero-runner.slice
+User=jero-runner
+Group=jero-runner
+RuntimeDirectory=jero-runner
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/bin/jero-kv-cache --socket /run/jero-runner/kv.sock
+Restart=always
+RestartSec=2
+LimitMEMLOCK=29360128K
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/jero-runner
+InaccessiblePaths=/etc/shadow /root
+
+[Install]
+WantedBy=multi-user.target

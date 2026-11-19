@@ -21,7 +21,29 @@ use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use crate::holder::KvHolder;
 
 /// Default Unix domain socket path for `jero-kv-cache`.
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/jero-kv-cache.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/jero-runner/kv.sock";
+
+/// Environment variable overriding the default Unix domain socket path for `jero-kv-cache`.
+pub const ENV_KV_SOCKET: &str = "JERO_KV_SOCKET";
+
+/// Resolves the socket path from an optional environment override value, falling back to [`DEFAULT_SOCKET_PATH`].
+#[must_use]
+pub fn resolve_socket_path_from(env_val: Option<&str>) -> PathBuf {
+    if let Some(raw) = env_val {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from(DEFAULT_SOCKET_PATH)
+}
+
+/// Resolves the default Unix domain socket path, preferring [`ENV_KV_SOCKET`] ahead of [`DEFAULT_SOCKET_PATH`].
+#[must_use]
+pub fn default_socket_path() -> PathBuf {
+    let env_val = std::env::var(ENV_KV_SOCKET).ok();
+    resolve_socket_path_from(env_val.as_deref())
+}
 
 /// Configuration for [`KvServer`].
 #[derive(Debug, Clone)]
@@ -35,7 +57,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
+            socket_path: default_socket_path(),
             max_memory_bytes: DEFAULT_LIMIT_MEMLOCK_BYTES,
         }
     }
@@ -1126,5 +1148,22 @@ mod tests {
         server.shutdown();
         handle.await.unwrap();
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_default_socket_path_and_env_resolution() {
+        assert_eq!(DEFAULT_SOCKET_PATH, "/run/jero-runner/kv.sock");
+        assert_eq!(
+            resolve_socket_path_from(None),
+            PathBuf::from("/run/jero-runner/kv.sock")
+        );
+        assert_eq!(
+            resolve_socket_path_from(Some("   ")),
+            PathBuf::from("/run/jero-runner/kv.sock")
+        );
+        assert_eq!(
+            resolve_socket_path_from(Some(" /tmp/custom-kv.sock ")),
+            PathBuf::from("/tmp/custom-kv.sock")
+        );
     }
 }

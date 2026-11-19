@@ -27,8 +27,8 @@ pub use quant_kv::{
     pack_kv_row, quantize_q8_0_block, unpack_kv_range_plane, unpack_kv_row,
 };
 pub use server::{
-    DEFAULT_SOCKET_PATH, KvServer, ServerConfig, SocketFileGuard, handle_connection,
-    prepare_and_bind_socket,
+    DEFAULT_SOCKET_PATH, ENV_KV_SOCKET, KvServer, ServerConfig, SocketFileGuard,
+    default_socket_path, handle_connection, prepare_and_bind_socket, resolve_socket_path_from,
 };
 
 /// Maps Dory1.0 virtual execution sub-layer indices (`0 .. n_input + n_recurrent * n_loops + n_output`)
