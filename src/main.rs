@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use jero_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 use jero_kv_cache::holder::KvHolder;
-use jero_kv_cache::server::{DEFAULT_SOCKET_PATH, KvServer, SocketFileGuard};
+use jero_kv_cache::server::{KvServer, SocketFileGuard, default_socket_path};
 
 /// Command line configuration for `jero-kv-cache`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub struct KvConfig {
 impl Default for KvConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
+            socket_path: default_socket_path(),
             max_memory_bytes: DEFAULT_LIMIT_MEMLOCK_BYTES, // 28 GiB
             verbose: false,
         }
@@ -142,7 +142,7 @@ USAGE:
     jero-kv-cache [OPTIONS]
 
 OPTIONS:
-    --socket <path>              Path to Unix Domain Socket [default: /tmp/jero-kv-cache.sock]
+    --socket <path>              Path to Unix Domain Socket [default: /run/jero-runner/kv.sock or $JERO_KV_SOCKET]
     --max-memory-bytes <bytes>   Maximum memory ceiling in bytes [default: 28 GiB]
     --verbose                    Enable verbose diagnostic output
     -h, --help                   Print help information
@@ -297,4 +297,61 @@ async fn main() -> ExitCode {
     }
 
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jero_kv_cache::server::{DEFAULT_SOCKET_PATH, ENV_KV_SOCKET};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_socket_precedence_cli_over_env_over_default() {
+        let _guard = ENV_LOCK.lock().expect("lock env mutex");
+        let prev = env::var_os(ENV_KV_SOCKET);
+
+        // 1. Default when env var is unset
+        // SAFETY: Protected by ENV_LOCK across tests in this binary.
+        unsafe {
+            env::remove_var(ENV_KV_SOCKET);
+        }
+        let cfg_default = KvConfig::parse_args(["jero-kv-cache".to_owned()].into_iter())
+            .expect("parse default")
+            .expect("config");
+        assert_eq!(cfg_default.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
+
+        // 2. Env var fallback ahead of DEFAULT_SOCKET_PATH
+        // SAFETY: Protected by ENV_LOCK across tests in this binary.
+        unsafe {
+            env::set_var(ENV_KV_SOCKET, "/tmp/env-kv.sock");
+        }
+        let cfg_env = KvConfig::parse_args(["jero-kv-cache".to_owned()].into_iter())
+            .expect("parse env")
+            .expect("config");
+        assert_eq!(cfg_env.socket_path, PathBuf::from("/tmp/env-kv.sock"));
+
+        // 3. CLI --socket overrides JERO_KV_SOCKET
+        let cfg_cli = KvConfig::parse_args(
+            [
+                "jero-kv-cache".to_owned(),
+                "--socket".to_owned(),
+                "/tmp/cli-kv.sock".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .expect("parse cli")
+        .expect("config");
+        assert_eq!(cfg_cli.socket_path, PathBuf::from("/tmp/cli-kv.sock"));
+
+        // Restore original environment state
+        // SAFETY: Protected by ENV_LOCK across tests in this binary.
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(ENV_KV_SOCKET, v),
+                None => env::remove_var(ENV_KV_SOCKET),
+            }
+        }
+    }
 }
